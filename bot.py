@@ -142,6 +142,21 @@ def find_discount_per_sqm(discounts: list[dict], down_pct: float) -> float:
     return applicable
 
 
+def find_discount_for_amount(discounts: list[dict], down_amount: float,
+                              area: float, base_price_per_sqm: float) -> float:
+    """Returns rub/m² discount applicable when paying a fixed ruble amount as down payment.
+    Correctly checks against the DISCOUNTED total (not original price)."""
+    best = 0.0
+    for d in sorted(discounts, key=lambda x: x["from_pct"]):
+        disc = d.get("discount_per_sqm", 0)
+        threshold_pct = d["from_pct"]
+        discounted_total = area * (base_price_per_sqm - disc)
+        min_required = discounted_total * threshold_pct / 100
+        if down_amount >= min_required:
+            best = disc
+    return best
+
+
 def _skip_btn(callback: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("Пропустить", callback_data=callback)]])
 
@@ -1793,17 +1808,24 @@ async def uc_layout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["uc_mand_mode"] = False
     disc_text = ""
     if discounts:
-        disc_lines = [
-            f"  от {d['from_pct']}% → −{fmt(d.get('discount_per_sqm', 0))} руб/м²"
-            for d in sorted(discounts, key=lambda x: x["from_pct"])
-        ]
+        disc_lines = []
+        for d in sorted(discounts, key=lambda x: x["from_pct"]):
+            disc       = d.get("discount_per_sqm", 0)
+            thr        = d["from_pct"]
+            disc_price = group["price_per_sqm"] - disc
+            disc_total = layout["area"] * disc_price
+            down_sum   = disc_total * thr / 100
+            disc_lines.append(
+                f"  от {thr}% → {fmt(disc_price)} руб/м² "
+                f"(взнос {thr}% = *{fmt(down_sum)} руб*)"
+            )
         disc_text = "\n\nСнижение цены при взносе:\n" + "\n".join(disc_lines)
     min_note = f"минимум {min_pct}%" if min_pct > 0 else "можно 0%"
     await cq.edit_message_text(
         f"*{layout['name']}*, {layout['area']} м²\n"
         f"Этаж: {group['label']}\n"
         f"Цена за м²: {fmt(group['price_per_sqm'])} руб\n"
-        f"Стоимость квартиры: {fmt(apt_price)} руб"
+        f"Стоимость: {fmt(apt_price)} руб"
         f"{disc_text}\n\n"
         f"Введите первоначальный взнос ({min_note}):\n"
         f"— в процентах: 30\n"
@@ -1846,17 +1868,18 @@ async def uc_down(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         down_amount   = total_price * down_pct / 100
         down_label    = f"Взнос {down_pct}%: {fmt(down_amount)} руб"
     else:
-        # Rubles mode — derive % from the entered amount
-        down_amount = value
-        # First estimate with base price, then refine with discount
-        base_price   = layout["area"] * group["price_per_sqm"]
-        approx_pct   = down_amount / base_price * 100
-        disc_per_sqm  = find_discount_per_sqm(discounts, approx_pct)
+        # Rubles mode — find discount based on the absolute amount vs discounted total
+        down_amount   = value
+        disc_per_sqm  = find_discount_for_amount(discounts, down_amount,
+                                                  layout["area"], group["price_per_sqm"])
         price_per_sqm = group["price_per_sqm"] - disc_per_sqm
         total_price   = layout["area"] * price_per_sqm
         down_pct      = down_amount / total_price * 100
         if down_pct < min_pct:
-            min_amount = total_price * min_pct / 100
+            # Show minimum as rubles from the best possible discounted price
+            best_disc    = find_discount_for_amount(discounts, 0, layout["area"], group["price_per_sqm"])
+            best_price   = layout["area"] * (group["price_per_sqm"] - best_disc)
+            min_amount   = best_price * min_pct / 100
             await update.message.reply_text(
                 f"Минимальный взнос {min_pct}% = {fmt(min_amount)} руб. Введите сумму не меньше:"
             )
