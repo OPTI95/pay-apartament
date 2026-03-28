@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venvScriptspython.exe -c \":*)",
+      "Bash(\"venv/Scripts/python.exe\" -c \":*)"
+    ]
+  }
+}
