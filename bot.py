@@ -278,6 +278,32 @@ async def list_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
 # Admin: /addadmin  /removeadmin  /listadmins
 # ---------------------------------------------------------------------------
 
+_ADMIN_COMMANDS = [
+    BotCommand("start",           "Начать / помощь"),
+    BotCommand("post",            "Добавить новый ЖК"),
+    BotCommand("edit",            "Редактировать ЖК"),
+    BotCommand("delete",          "Удалить ЖК"),
+    BotCommand("calc",            "Настроить калькулятор"),
+    BotCommand("setcount",        "Изменить количество квартир в планировке"),
+    BotCommand("list",            "Список всех ЖК"),
+    BotCommand("browse",          "Подбор ЖК по районам"),
+    BotCommand("adddistrict",     "Добавить район"),
+    BotCommand("removedistrict",  "Удалить район"),
+    BotCommand("listdistricts",   "Список районов"),
+    BotCommand("addadmin",        "Добавить администратора"),
+    BotCommand("removeadmin",     "Удалить администратора"),
+    BotCommand("listadmins",      "Список администраторов"),
+    BotCommand("cancel",          "Отменить текущее действие"),
+]
+
+
+async def _set_admin_commands(bot, user_id: int) -> None:
+    try:
+        await bot.set_my_commands(_ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=user_id))
+    except BadRequest as e:
+        logger.warning("Could not set commands for admin %d: %s", user_id, e)
+
+
 async def addadmin_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id not in _ENV_ADMINS:
         await update.message.reply_text("Только главный администратор может добавлять других.")
@@ -289,6 +315,7 @@ async def addadmin_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = int(parts[1])
     db.add_admin(user_id)
     refresh_admins()
+    await _set_admin_commands(_context.bot, user_id)
     await update.message.reply_text(f"Администратор {user_id} добавлен.")
 
 
@@ -2128,31 +2155,8 @@ def main() -> None:
             ],
             scope=BotCommandScopeDefault(),
         )
-        admin_commands = [
-            BotCommand("start",           "Начать / помощь"),
-            BotCommand("post",            "Добавить новый ЖК"),
-            BotCommand("edit",            "Редактировать ЖК"),
-            BotCommand("delete",          "Удалить ЖК"),
-            BotCommand("calc",            "Настроить калькулятор"),
-            BotCommand("setcount",        "Изменить количество квартир в планировке"),
-            BotCommand("list",            "Список всех ЖК"),
-            BotCommand("browse",          "Подбор ЖК по районам"),
-            BotCommand("adddistrict",     "Добавить район"),
-            BotCommand("removedistrict",  "Удалить район"),
-            BotCommand("listdistricts",   "Список районов"),
-            BotCommand("addadmin",        "Добавить администратора"),
-            BotCommand("removeadmin",     "Удалить администратора"),
-            BotCommand("listadmins",      "Список администраторов"),
-            BotCommand("cancel",          "Отменить текущее действие"),
-        ]
-        all_admin_ids = _ENV_ADMINS | _db_admins
-        for admin_id in all_admin_ids:
-            try:
-                await application.bot.set_my_commands(
-                    admin_commands, scope=BotCommandScopeChat(chat_id=admin_id)
-                )
-            except BadRequest as e:
-                logger.warning("Could not set commands for admin %d: %s", admin_id, e)
+        for admin_id in _ENV_ADMINS | _db_admins:
+            await _set_admin_commands(application.bot, admin_id)
 
     app = Application.builder().token(TOKEN).post_init(post_init).build()
 
