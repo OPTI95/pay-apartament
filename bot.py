@@ -487,7 +487,7 @@ async def subprice_cancel(update: Update, _context: ContextTypes.DEFAULT_TYPE) -
 async def _send_apt_card(msg, apt: dict, admin_user: bool, user_id: int = 0) -> None:
     """Send one apartment card as a photo (or text fallback)."""
     if user_id:
-        db.log_view(user_id, apt["id"])
+        db.log_view(user_id, apt["id"], "apt")
 
     floor_prices = apt.get("floor_prices")
     if floor_prices and len(floor_prices) > 1:
@@ -1871,8 +1871,14 @@ async def top_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+_DETAIL_LABELS = {
+    "apt":        "Квартиры",
+    "commercial": "Коммерция",
+}
+
+
 async def top_open_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Open ЖК card from /top list."""
+    """Show view breakdown for a ЖК from /top, with open buttons."""
     cq = update.callback_query
     await cq.answer()
     apt_id = cq.data.split("|", 1)[1]
@@ -1880,8 +1886,65 @@ async def top_open_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE)
     if not apt:
         await cq.message.reply_text("ЖК не найден.")
         return
+
+    breakdown = db.get_views_breakdown_today(apt_id)
+    lines = [f"*{apt['name']}* — что смотрели сегодня:\n"]
+    for row in breakdown:
+        label = _DETAIL_LABELS.get(row["detail"], row["detail"])
+        lines.append(f"• {label} — {row['cnt']} раз")
+    if not breakdown:
+        lines.append("Нет данных за сегодня.")
+
+    # Buttons to open each section
+    keyboard = [[InlineKeyboardButton("Открыть карточку", callback_data=f"top_card|{apt_id}")]]
+    if db.get_commercial(apt_id):
+        keyboard.append([InlineKeyboardButton("Открыть коммерцию", callback_data=f"top_comm|{apt_id}")])
+
+    await cq.message.reply_text(
+        "\n".join(lines), parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def top_card_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    apt_id = cq.data.split("|", 1)[1]
+    apt    = next((a for a in db.get_all_apartments() if a["id"] == apt_id), None)
+    if not apt:
+        return
     uid = cq.from_user.id
     await _send_apt_card(cq.message, apt, is_admin(uid), user_id=uid)
+
+
+async def top_comm_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    apt_id = cq.data.split("|", 1)[1]
+    comm   = db.get_commercial(apt_id)
+    if not comm:
+        await cq.message.reply_text("Коммерция не найдена.")
+        return
+    db.log_view(cq.from_user.id, apt_id, "commercial")
+    fp = comm.get("floor_prices")
+    if fp and len(fp) > 1:
+        price_lines = "\n".join(f"  {x['range']} эт.: {fmt(x['price'])} руб/м²" for x in fp)
+        price_display = f"от {fmt(comm['price_per_sqm'])} руб/м²\n{price_lines}"
+    else:
+        price_display = f"{fmt(comm['price_per_sqm'])} руб/м²"
+    inst_p     = comm.get("installment_price_per_sqm")
+    inst_line  = f"\nВ рассрочку: {fmt(inst_p)} руб/м²" if inst_p else ""
+    avail_mark = "" if comm.get("available", 1) else "\n\n❌ *НЕТ В НАЛИЧИИ*"
+    caption    = f"*Коммерческие помещения*\n\nЦена за м²: {price_display}{inst_line}{avail_mark}"
+    keyboard   = []
+    if is_valid_url(comm.get("layouts_url", "")):
+        keyboard.append([InlineKeyboardButton("Планировки", url=comm["layouts_url"])])
+    if comm.get("installment_text"):
+        keyboard.append([InlineKeyboardButton("Условия рассрочки", callback_data=f"comm_inst|{apt_id}")])
+    if db.get_calculator(f"comm_{apt_id}"):
+        keyboard.append([InlineKeyboardButton("Калькулятор рассрочки", callback_data=f"calc|comm_{apt_id}")])
+    await cq.message.reply_text(caption, parse_mode="Markdown",
+                                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
 
 
 # ---------------------------------------------------------------------------
@@ -3264,6 +3327,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(inv_unit_callback,       pattern=r"^inv_u\|"))
     app.add_handler(CallbackQueryHandler(analytics_apt_callback,  pattern=r"^anl\|"))
     app.add_handler(CallbackQueryHandler(top_open_callback,       pattern=r"^top_open\|"))
+    app.add_handler(CallbackQueryHandler(top_card_callback,       pattern=r"^top_card\|"))
+    app.add_handler(CallbackQueryHandler(top_comm_callback,       pattern=r"^top_comm\|"))
     app.add_handler(CallbackQueryHandler(del_ask_callback,    pattern=r"^del_ask\|"))
     app.add_handler(CallbackQueryHandler(del_yes_callback,    pattern=r"^del_yes\|"))
     app.add_handler(CallbackQueryHandler(del_cancel_callback, pattern=r"^del_cancel$"))

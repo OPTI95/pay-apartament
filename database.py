@@ -540,6 +540,19 @@ def get_layout_views_today(apt_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_views_breakdown_today(apt_id: str) -> list[dict]:
+    """All view counts for apt_id grouped by detail (including empty = main card)."""
+    with _get_conn() as conn:
+        rows = conn.execute("""
+            SELECT COALESCE(NULLIF(detail,''), 'apt') as detail, COUNT(*) as cnt
+            FROM view_analytics
+            WHERE apt_id = ? AND date(viewed_at) = date('now')
+            GROUP BY detail
+            ORDER BY cnt DESC
+        """, (apt_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Bot settings
 # ---------------------------------------------------------------------------
