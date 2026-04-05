@@ -65,6 +65,26 @@ def init_db() -> None:
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS search_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                query       TEXT NOT NULL,
+                apt_id      TEXT DEFAULT NULL,
+                searched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                username   TEXT DEFAULT '',
+                full_name  TEXT DEFAULT '',
+                message    TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_read    INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS commercial (
                 apt_id                    TEXT PRIMARY KEY,
                 price_per_sqm             INTEGER NOT NULL,
@@ -569,4 +589,144 @@ def set_bot_setting(key: str, value: str) -> None:
             "INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)",
             (key, value),
         )
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Search log
+# ---------------------------------------------------------------------------
+
+def log_search(user_id: int, query: str, apt_id: str | None) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO search_log (user_id, query, apt_id) VALUES (?, ?, ?)",
+            (user_id, query, apt_id),
+        )
+        conn.commit()
+
+
+def get_search_stats(period: str = "today") -> dict:
+    """period: 'today' | 'week' | 'all'"""
+    date_filter = {
+        "today": "date(searched_at) = date('now')",
+        "week":  "searched_at >= datetime('now', '-7 days')",
+        "all":   "1=1",
+    }.get(period, "date(searched_at) = date('now')")
+
+    with _get_conn() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM search_log WHERE {date_filter}"
+        ).fetchone()[0]
+
+        unique_users = conn.execute(
+            f"SELECT COUNT(DISTINCT user_id) FROM search_log WHERE {date_filter}"
+        ).fetchone()[0]
+
+        top_apts = conn.execute(f"""
+            SELECT apt_id, COUNT(*) as cnt FROM search_log
+            WHERE apt_id IS NOT NULL AND {date_filter}
+            GROUP BY apt_id ORDER BY cnt DESC LIMIT 5
+        """).fetchall()
+
+        top_queries = conn.execute(f"""
+            SELECT query, COUNT(*) as cnt FROM search_log
+            WHERE {date_filter}
+            GROUP BY lower(query) ORDER BY cnt DESC LIMIT 10
+        """).fetchall()
+
+        not_found = conn.execute(f"""
+            SELECT query, COUNT(*) as cnt FROM search_log
+            WHERE apt_id IS NULL AND {date_filter}
+            GROUP BY lower(query) ORDER BY cnt DESC LIMIT 5
+        """).fetchall()
+
+    return {
+        "total":        total,
+        "unique_users": unique_users,
+        "top_apts":     [dict(r) for r in top_apts],
+        "top_queries":  [dict(r) for r in top_queries],
+        "not_found":    [dict(r) for r in not_found],
+    }
+
+
+def get_view_stats(period: str = "today") -> dict:
+    date_filter = {
+        "today": "date(viewed_at) = date('now')",
+        "week":  "viewed_at >= datetime('now', '-7 days')",
+        "all":   "1=1",
+    }.get(period, "date(viewed_at) = date('now')")
+
+    with _get_conn() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM view_analytics WHERE {date_filter}"
+        ).fetchone()[0]
+
+        unique_users = conn.execute(
+            f"SELECT COUNT(DISTINCT user_id) FROM view_analytics WHERE {date_filter}"
+        ).fetchone()[0]
+
+        top_apts = conn.execute(f"""
+            SELECT apt_id, COUNT(*) as cnt FROM view_analytics
+            WHERE {date_filter}
+            GROUP BY apt_id ORDER BY cnt DESC LIMIT 5
+        """).fetchall()
+
+        top_details = conn.execute(f"""
+            SELECT COALESCE(NULLIF(detail,''), 'apt') as detail, COUNT(*) as cnt
+            FROM view_analytics
+            WHERE {date_filter}
+            GROUP BY detail ORDER BY cnt DESC LIMIT 10
+        """).fetchall()
+
+    return {
+        "total":        total,
+        "unique_users": unique_users,
+        "top_apts":     [dict(r) for r in top_apts],
+        "top_details":  [dict(r) for r in top_details],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Feedback
+# ---------------------------------------------------------------------------
+
+def save_feedback(user_id: int, username: str, full_name: str, message: str) -> int:
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO feedback (user_id, username, full_name, message) VALUES (?, ?, ?, ?)",
+            (user_id, username, full_name, message),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_all_feedbacks(limit: int = 50, offset: int = 0) -> list[dict]:
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM feedback ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_feedbacks_count() -> int:
+    with _get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0]
+
+
+def get_feedback(fb_id: int) -> dict | None:
+    with _get_conn() as conn:
+        row = conn.execute("SELECT * FROM feedback WHERE id = ?", (fb_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_feedback(fb_id: int) -> None:
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM feedback WHERE id = ?", (fb_id,))
+        conn.commit()
+
+
+def mark_feedback_read(fb_id: int) -> None:
+    with _get_conn() as conn:
+        conn.execute("UPDATE feedback SET is_read = 1 WHERE id = ?", (fb_id,))
         conn.commit()

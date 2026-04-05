@@ -47,6 +47,9 @@ _PLAN_META = {
 # Conversation states for /subprice
 SP_PICK_PLAN, SP_ENTER_RUB, SP_ENTER_STARS = range(90, 93)
 
+# Conversation states for /feedback (user)
+FB_MSG = 130
+
 
 def _get_plans() -> dict:
     """Returns merged plan dict with current DB prices."""
@@ -541,11 +544,12 @@ async def search_apartment(update: Update, _context: ContextTypes.DEFAULT_TYPE) 
     if not await _require_sub(update):
         return
     query = update.message.text.strip()
+    uid = update.effective_user.id
     apt = find_apartment(query)
+    db.log_search(uid, query, apt["id"] if apt else None)
     if not apt:
         await update.message.reply_text(f'ЖК по запросу "{query}" не найден.\nПопробуйте уточнить название.')
         return
-    uid = update.effective_user.id
     await _send_apt_card(update.message, apt, is_admin(uid), user_id=uid)
 
 
@@ -604,6 +608,226 @@ async def list_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Admin: /stats
+# ---------------------------------------------------------------------------
+
+_STATS_PERIODS = {"today": "Сегодня", "week": "Неделя", "all": "Всё время"}
+
+
+async def stats_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    keyboard = [[InlineKeyboardButton(label, callback_data=f"stats|{key}")]
+                for key, label in _STATS_PERIODS.items()]
+    await update.message.reply_text(
+        "📊 *Статистика бота*\n\nВыберите период:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def stats_period_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    if not is_admin(cq.from_user.id):
+        return
+    period = cq.data.split("|", 1)[1]
+    label = _STATS_PERIODS.get(period, period)
+
+    s = db.get_search_stats(period)
+    v = db.get_view_stats(period)
+
+    # Build apt_id → name mapping for pretty display
+    all_apts = {a["id"]: a["name"] for a in db.get_all_apartments()}
+
+    lines = [f"📊 *Статистика — {label}*\n"]
+
+    # Search block
+    lines.append("🔍 *Поиск:*")
+    lines.append(f"  • Запросов: {s['total']}")
+    lines.append(f"  • Уникальных пользователей: {s['unique_users']}")
+
+    if s["top_queries"]:
+        lines.append("\n  📝 Топ запросов:")
+        for i, row in enumerate(s["top_queries"][:5], 1):
+            lines.append(f"    {i}. {row['query']} — {row['cnt']}×")
+
+    if s["not_found"]:
+        lines.append("\n  ❓ Не найдено:")
+        for row in s["not_found"][:5]:
+            lines.append(f"    • {row['query']} — {row['cnt']}×")
+
+    if s["top_apts"]:
+        lines.append("\n  🏠 Топ ЖК по поиску:")
+        for i, row in enumerate(s["top_apts"][:5], 1):
+            name = all_apts.get(row["apt_id"], row["apt_id"])
+            lines.append(f"    {i}. {name} — {row['cnt']}×")
+
+    # View block
+    lines.append("\n👁 *Просмотры:*")
+    lines.append(f"  • Всего: {v['total']}")
+    lines.append(f"  • Уникальных пользователей: {v['unique_users']}")
+
+    if v["top_apts"]:
+        lines.append("\n  🏆 Топ ЖК:")
+        for i, row in enumerate(v["top_apts"][:5], 1):
+            name = all_apts.get(row["apt_id"], row["apt_id"])
+            lines.append(f"    {i}. {name} — {row['cnt']}×")
+
+    if v["top_details"]:
+        lines.append("\n  📂 По разделам:")
+        section_names = {"apt": "Квартиры", "commercial": "Коммерция", "investor": "Инвесторы"}
+        for row in v["top_details"]:
+            lines.append(f"    • {section_names.get(row['detail'], row['detail'])}: {row['cnt']}")
+
+    keyboard = [[InlineKeyboardButton(lbl, callback_data=f"stats|{k}")]
+                for k, lbl in _STATS_PERIODS.items()]
+    await cq.edit_message_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ---------------------------------------------------------------------------
+# User: /feedback
+# ---------------------------------------------------------------------------
+
+async def feedback_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "💬 *Обратная связь*\n\nНапишите ваше сообщение, вопрос или предложение.\n\n"
+        "Для отмены — /cancel",
+        parse_mode="Markdown",
+    )
+    return FB_MSG
+
+
+async def feedback_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    uid = update.effective_user.id
+    username = update.effective_user.username or ""
+    full_name = update.effective_user.full_name or ""
+    text = update.message.text.strip()
+    fb_id = db.save_feedback(uid, username, full_name, text)
+    await update.message.reply_text("Спасибо! Ваше сообщение отправлено администратору. ✅")
+
+    # Notify all admins
+    admin_ids = _ENV_ADMINS | _db_admins
+    for admin_id in admin_ids:
+        try:
+            uname_str = f"@{username}" if username else f"ID {uid}"
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Посмотреть", callback_data=f"fb_view|{fb_id}"),
+                InlineKeyboardButton("К пользователю", url=f"tg://user?id={uid}"),
+            ]])
+            await context.bot.send_message(
+                admin_id,
+                f"📩 Новое обращение от {uname_str}:\n\n{text[:300]}",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            pass
+    return ConversationHandler.END
+
+
+async def feedback_cancel(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Admin: /feedbacks
+# ---------------------------------------------------------------------------
+
+_FB_PAGE_SIZE = 5
+
+
+async def feedbacks_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    await _show_feedbacks_page(update.message, 0)
+
+
+async def _show_feedbacks_page(msg, offset: int) -> None:
+    feedbacks = db.get_all_feedbacks(limit=_FB_PAGE_SIZE, offset=offset)
+    total = db.get_feedbacks_count()
+    if not feedbacks:
+        await msg.reply_text("Нет обращений.")
+        return
+
+    lines = [f"📋 *Обращения* ({offset + 1}–{min(offset + _FB_PAGE_SIZE, total)} из {total}):\n"]
+    keyboard = []
+    for fb in feedbacks:
+        created = fb["created_at"][:16].replace("T", " ")
+        uname = f"@{fb['username']}" if fb["username"] else f"ID {fb['user_id']}"
+        new_mark = " 🆕" if not fb.get("is_read") else ""
+        lines.append(f"*#{fb['id']}* — {uname} — {created}{new_mark}")
+        lines.append(f"  {fb['message'][:80]}{'…' if len(fb['message']) > 80 else ''}\n")
+        keyboard.append([
+            InlineKeyboardButton(f"#{fb['id']} Читать", callback_data=f"fb_view|{fb['id']}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"fb_del|{fb['id']}"),
+        ])
+
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton("◀️", callback_data=f"fb_page|{offset - _FB_PAGE_SIZE}"))
+    if offset + _FB_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton("▶️", callback_data=f"fb_page|{offset + _FB_PAGE_SIZE}"))
+    if nav:
+        keyboard.append(nav)
+
+    await msg.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def feedbacks_page_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    if not is_admin(cq.from_user.id):
+        return
+    offset = int(cq.data.split("|", 1)[1])
+    await _show_feedbacks_page(cq.message, offset)
+
+
+async def fb_view_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    if not is_admin(cq.from_user.id):
+        return
+    fb_id = int(cq.data.split("|", 1)[1])
+    fb = db.get_feedback(fb_id)
+    if not fb:
+        await cq.message.reply_text("Обращение не найдено.")
+        return
+    db.mark_feedback_read(fb_id)
+    created = fb["created_at"][:16].replace("T", " ")
+    uname = f"@{fb['username']}" if fb["username"] else f"ID {fb['user_id']}"
+    text = (
+        f"📩 *Обращение #{fb['id']}*\n"
+        f"От: {uname}\n"
+        f"Дата: {created}\n\n"
+        f"{fb['message']}"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Написать пользователю", url=f"tg://user?id={fb['user_id']}"),
+        InlineKeyboardButton("🗑 Удалить", callback_data=f"fb_del|{fb_id}"),
+    ]])
+    await cq.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def fb_del_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    if not is_admin(cq.from_user.id):
+        return
+    fb_id = int(cq.data.split("|", 1)[1])
+    db.delete_feedback(fb_id)
+    await cq.edit_message_text(f"Обращение #{fb_id} удалено.")
+
+
+# ---------------------------------------------------------------------------
 # Admin: /addadmin  /removeadmin  /listadmins
 # ---------------------------------------------------------------------------
 
@@ -611,6 +835,7 @@ _ADMIN_COMMANDS = [
     BotCommand("start",           "Начать / помощь"),
     BotCommand("subscribe",       "Статус подписки"),
     BotCommand("top",             "Топ популярных ЖК сегодня"),
+    BotCommand("feedback",        "Написать администратору"),
     BotCommand("post",            "Добавить новый ЖК"),
     BotCommand("edit",            "Редактировать ЖК"),
     BotCommand("delete",          "Удалить ЖК"),
@@ -631,6 +856,8 @@ _ADMIN_COMMANDS = [
     BotCommand("investor",        "Добавить инвесторские объекты"),
     BotCommand("setavail",        "Изменить наличие квартир/коммерции"),
     BotCommand("reporttime",      "Время отчёта: /reporttime ЧЧ:ММ"),
+    BotCommand("stats",           "Статистика бота"),
+    BotCommand("feedbacks",       "Обращения от пользователей"),
     BotCommand("cancel",          "Отменить текущее действие"),
 ]
 
@@ -2692,14 +2919,16 @@ UC_LAYOUT, UC_DOWN, UC_TERM = range(50, 53)
 async def uc_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     cq = update.callback_query
     await cq.answer()
-    apt_id = cq.data.split("|", 1)[1]
-    calc   = db.get_calculator(apt_id)
-    apt    = next((a for a in db.get_all_apartments() if a["id"] == apt_id), None)
+    calc_key   = cq.data.split("|", 1)[1]          # may be "comm_<apt_id>" or "<apt_id>"
+    real_apt_id = _calc_apt_id(calc_key)
+    calc   = db.get_calculator(calc_key)
+    apt    = next((a for a in db.get_all_apartments() if a["id"] == real_apt_id), None)
     if not calc or not apt:
         await cq.message.reply_text("Калькулятор недоступен.")
         return ConversationHandler.END
-    context.user_data["uc_apt_id"]   = apt_id
-    context.user_data["uc_apt_name"] = apt["name"]
+    name_suffix = " — Коммерция" if calc_key.startswith("comm_") else ""
+    context.user_data["uc_apt_id"]   = calc_key
+    context.user_data["uc_apt_name"] = apt["name"] + name_suffix
     context.user_data["uc_calc"]     = calc
     keyboard = []
     for g_idx, group in enumerate(calc["floor_groups"]):
@@ -3095,9 +3324,10 @@ def main() -> None:
             [
                 BotCommand("start",     "Начать / помощь"),
                 BotCommand("subscribe", "Оформить подписку"),
-                BotCommand("list",     "Список всех ЖК"),
-                BotCommand("browse",   "Подбор ЖК по районам"),
-                BotCommand("top",      "Топ популярных ЖК сегодня"),
+                BotCommand("list",      "Список всех ЖК"),
+                BotCommand("browse",    "Подбор ЖК по районам"),
+                BotCommand("top",       "Топ популярных ЖК сегодня"),
+                BotCommand("feedback",  "Написать администратору"),
             ],
             scope=BotCommandScopeDefault(),
         )
@@ -3290,6 +3520,15 @@ def main() -> None:
         per_message=False,
     )
 
+    feedback_conv = ConversationHandler(
+        entry_points=[CommandHandler("feedback", feedback_cmd)],
+        states={
+            FB_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_msg)],
+        },
+        fallbacks=[CommandHandler("cancel", feedback_cancel)],
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler("myid",           myid_cmd))
     app.add_handler(CommandHandler("start",          start))
     app.add_handler(CommandHandler("subscribe",      subscribe_cmd))
@@ -3307,6 +3546,8 @@ def main() -> None:
     app.add_handler(CommandHandler("delsub",         delsub_cmd))
     app.add_handler(CommandHandler("reporttime",     reporttime_cmd))
     app.add_handler(CommandHandler("top",            top_cmd))
+    app.add_handler(CommandHandler("stats",          stats_cmd))
+    app.add_handler(CommandHandler("feedbacks",      feedbacks_cmd))
     app.add_handler(post_conv)
     app.add_handler(edit_conv)
     app.add_handler(calc_setup_conv)
@@ -3315,6 +3556,7 @@ def main() -> None:
     app.add_handler(subprice_conv)
     app.add_handler(investor_conv)
     app.add_handler(setavail_conv)
+    app.add_handler(feedback_conv)
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
     app.add_handler(CallbackQueryHandler(sub_plans_callback,      pattern=r"^sub_plans$"))
@@ -3339,6 +3581,10 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(browse_apt_callback,      pattern=r"^br_a\|"))
     app.add_handler(CallbackQueryHandler(browse_back_callback,     pattern=r"^br_back$"))
     app.add_handler(CallbackQueryHandler(removedistrict_callback,  pattern=r"^(rmd\||rmd_cancel$)"))
+    app.add_handler(CallbackQueryHandler(stats_period_callback,    pattern=r"^stats\|"))
+    app.add_handler(CallbackQueryHandler(feedbacks_page_callback,  pattern=r"^fb_page\|"))
+    app.add_handler(CallbackQueryHandler(fb_view_callback,         pattern=r"^fb_view\|"))
+    app.add_handler(CallbackQueryHandler(fb_del_callback,          pattern=r"^fb_del\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_apartment))
 
     # Schedule daily analytics report

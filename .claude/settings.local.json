@@ -2,7 +2,19 @@
   "permissions": {
     "allow": [
       "Bash(venvScriptspython.exe -c \":*)",
-      "Bash(\"venv/Scripts/python.exe\" -c \":*)"
+      "Bash(\"venv/Scripts/python.exe\" -c \":*)",
+      "Bash(gh repo:*)",
+      "Bash(git remote:*)",
+      "Bash(git push:*)",
+      "WebSearch",
+      "WebFetch(domain:dev.to)",
+      "WebFetch(domain:github.com)",
+      "Bash(python3 -m py_compile bot.py)",
+      "Bash(python3 -m py_compile database.py)",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)",
+      "Bash(python -m py_compile bot.py)",
+      "Bash(python -m py_compile database.py)"
     ]
   }
 }
