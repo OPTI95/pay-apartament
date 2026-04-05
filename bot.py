@@ -1493,6 +1493,8 @@ async def comm_card_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE
         keyboard.append([InlineKeyboardButton("Планировки", url=comm["layouts_url"])])
     if comm.get("installment_text"):
         keyboard.append([InlineKeyboardButton("Условия рассрочки", callback_data=f"comm_inst|{apt_id}")])
+    if db.get_calculator(f"comm_{apt_id}"):
+        keyboard.append([InlineKeyboardButton("Калькулятор рассрочки", callback_data=f"calc|comm_{apt_id}")])
     await cq.message.reply_text(caption, parse_mode="Markdown",
                                  reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
 
@@ -1897,6 +1899,19 @@ CE_TERMS, CE_AFTER = range(70, 80)
 CE_MANDATORY_VALUE, CE_INST_BASE_EDIT = 80, 81
 
 
+def _calc_label(calc_key: str, apts_map: dict) -> str:
+    """Human-readable label for a calculator key (apt_id or comm_<apt_id>)."""
+    if calc_key.startswith("comm_"):
+        name = apts_map.get(calc_key[5:], calc_key[5:])
+        return f"{name} — Коммерция"
+    return apts_map.get(calc_key, calc_key)
+
+
+def _calc_apt_id(calc_key: str) -> str:
+    """Extract real apt_id from calc key (strips comm_ prefix)."""
+    return calc_key[5:] if calc_key.startswith("comm_") else calc_key
+
+
 async def calc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Нет доступа.")
@@ -1906,9 +1921,15 @@ async def calc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Список ЖК пуст.")
         return ConversationHandler.END
     context.user_data.clear()
-    keyboard = [[InlineKeyboardButton(a["name"], callback_data=f"cpa|{a['id']}")] for a in apts]
+    keyboard = []
+    for a in apts:
+        has_calc = "🧮 " if db.get_calculator(a["id"]) else ""
+        keyboard.append([InlineKeyboardButton(f"{has_calc}{a['name']} — Квартиры", callback_data=f"cpa|{a['id']}")])
+        if db.get_commercial(a["id"]):
+            has_comm_calc = "🧮 " if db.get_calculator(f"comm_{a['id']}") else ""
+            keyboard.append([InlineKeyboardButton(f"{has_comm_calc}{a['name']} — Коммерция", callback_data=f"cpa|comm_{a['id']}")])
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="csx")])
-    await update.message.reply_text("Выберите ЖК для настройки калькулятора:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text("Выберите раздел для настройки калькулятора:", reply_markup=InlineKeyboardMarkup(keyboard))
     return CS_PICK_APT
 
 
@@ -1930,24 +1951,26 @@ async def cs_pick_apt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         context.user_data.clear()
         await cq.edit_message_text("Отменено.")
         return ConversationHandler.END
-    apt_id = cq.data.split("|", 1)[1]
-    apt = next((a for a in db.get_all_apartments() if a["id"] == apt_id), None)
+    calc_key = cq.data.split("|", 1)[1]          # may be "comm_<apt_id>" or "<apt_id>"
+    real_apt_id = _calc_apt_id(calc_key)
+    apt = next((a for a in db.get_all_apartments() if a["id"] == real_apt_id), None)
     if not apt:
         await cq.edit_message_text("ЖК не найден.")
         return ConversationHandler.END
-    existing = db.get_calculator(apt_id)
+    display_name = _calc_label(calc_key, {real_apt_id: apt["name"]})
+    existing = db.get_calculator(calc_key)
     if existing:
         keyboard = [
-            [InlineKeyboardButton("Редактировать", callback_data=f"csa_edit|{apt_id}")],
-            [InlineKeyboardButton("Удалить",        callback_data=f"csa_del|{apt_id}")],
+            [InlineKeyboardButton("Редактировать", callback_data=f"csa_edit|{calc_key}")],
+            [InlineKeyboardButton("Удалить",        callback_data=f"csa_del|{calc_key}")],
             [InlineKeyboardButton("Отмена",          callback_data="csx")],
         ]
         await cq.edit_message_text(
-            f"У ЖК *{apt['name']}* уже есть калькулятор. Что сделать?",
+            f"У *{display_name}* уже есть калькулятор. Что сделать?",
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return CS_ASK_ACTION
-    return await _cs_start_setup(cq, apt_id, apt["name"], context)
+    return await _cs_start_setup(cq, calc_key, display_name, context)
 
 
 async def cs_ask_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1957,18 +1980,20 @@ async def cs_ask_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         context.user_data.clear()
         await cq.edit_message_text("Отменено.")
         return ConversationHandler.END
-    action, apt_id = cq.data.split("|", 1)
-    apt = next((a for a in db.get_all_apartments() if a["id"] == apt_id), None)
+    action, calc_key = cq.data.split("|", 1)
+    real_apt_id = _calc_apt_id(calc_key)
+    apts_map = {a["id"]: a["name"] for a in db.get_all_apartments()}
+    display_name = _calc_label(calc_key, apts_map)
     if action == "csa_del":
-        db.delete_calculator(apt_id)
+        db.delete_calculator(calc_key)
         context.user_data.clear()
-        await cq.edit_message_text(f"Калькулятор ЖК *{apt['name']}* удалён.", parse_mode="Markdown")
+        await cq.edit_message_text(f"Калькулятор *{display_name}* удалён.", parse_mode="Markdown")
         return ConversationHandler.END
     # csa_edit — open dashboard editor
-    calc = db.get_calculator(apt_id)
-    context.user_data["cs_apt_id"]  = apt_id
-    context.user_data["ce_apt_name"] = apt["name"]
-    context.user_data["ce_calc"]    = calc
+    calc = db.get_calculator(calc_key)
+    context.user_data["cs_apt_id"]   = calc_key
+    context.user_data["ce_apt_name"] = display_name
+    context.user_data["ce_calc"]     = calc
     return await _ce_edit_menu(cq, context)
 
 
