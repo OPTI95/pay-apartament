@@ -64,12 +64,52 @@ def init_db() -> None:
                 name TEXT UNIQUE NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS commercial (
+                apt_id                    TEXT PRIMARY KEY,
+                price_per_sqm             INTEGER NOT NULL,
+                floor_prices              TEXT DEFAULT NULL,
+                installment_text          TEXT DEFAULT '',
+                installment_price_per_sqm INTEGER DEFAULT NULL,
+                layouts_url               TEXT DEFAULT '',
+                photos_url                TEXT DEFAULT '',
+                photos_file_ids           TEXT DEFAULT '[]',
+                available                 INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS investor_units (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                apt_id         TEXT NOT NULL,
+                unit_type      TEXT NOT NULL DEFAULT 'apt',
+                floor          INTEGER NOT NULL,
+                layout_name    TEXT NOT NULL,
+                investor_phone TEXT NOT NULL,
+                available      INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS view_analytics (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id   INTEGER NOT NULL,
+                apt_id    TEXT NOT NULL,
+                detail    TEXT DEFAULT '',
+                viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         # Migrate existing DB: add columns if missing
         for alter in [
             "ALTER TABLE apartments ADD COLUMN floor_prices TEXT DEFAULT NULL",
             "ALTER TABLE apartments ADD COLUMN district_id INTEGER DEFAULT NULL",
             "ALTER TABLE apartments ADD COLUMN photos_file_ids TEXT DEFAULT '[]'",
             "ALTER TABLE apartments ADD COLUMN installment_price_per_sqm INTEGER DEFAULT NULL",
+            "ALTER TABLE apartments ADD COLUMN available INTEGER NOT NULL DEFAULT 1",
         ]:
             try:
                 conn.execute(alter)
@@ -361,4 +401,159 @@ def update_plan_prices(plan_key: str, price_rub: int, price_stars: int) -> None:
             INSERT OR REPLACE INTO subscription_plans (plan_key, price_rub, price_stars)
             VALUES (?, ?, ?)
         """, (plan_key, price_rub, price_stars))
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Commercial spaces
+# ---------------------------------------------------------------------------
+
+def save_commercial(apt_id: str, data: dict) -> None:
+    floor_prices = data.get("floor_prices")
+    with _get_conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO commercial
+            (apt_id, price_per_sqm, floor_prices, installment_text,
+             installment_price_per_sqm, layouts_url, photos_url, photos_file_ids, available)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            apt_id,
+            data["price_per_sqm"],
+            json.dumps(floor_prices, ensure_ascii=False) if floor_prices else None,
+            data.get("installment_text", ""),
+            data.get("installment_price_per_sqm"),
+            data.get("layouts_url", ""),
+            data.get("photos_url", ""),
+            json.dumps(data.get("photos_file_ids", []), ensure_ascii=False),
+            data.get("available", 1),
+        ))
+        conn.commit()
+
+
+def get_commercial(apt_id: str) -> dict | None:
+    with _get_conn() as conn:
+        row = conn.execute("SELECT * FROM commercial WHERE apt_id = ?", (apt_id,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["floor_prices"] = json.loads(d["floor_prices"]) if d.get("floor_prices") else None
+    d["photos_file_ids"] = json.loads(d["photos_file_ids"]) if d.get("photos_file_ids") else []
+    return d
+
+
+def delete_commercial(apt_id: str) -> None:
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM commercial WHERE apt_id = ?", (apt_id,))
+        conn.commit()
+
+
+def set_commercial_availability(apt_id: str, available: int) -> None:
+    with _get_conn() as conn:
+        conn.execute("UPDATE commercial SET available = ? WHERE apt_id = ?", (available, apt_id))
+        conn.commit()
+
+
+def set_apartment_availability(apt_id: str, available: int) -> None:
+    with _get_conn() as conn:
+        conn.execute("UPDATE apartments SET available = ? WHERE id = ?", (available, apt_id))
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Investor units
+# ---------------------------------------------------------------------------
+
+def add_investor_unit(apt_id: str, unit_type: str, floor: int,
+                      layout_name: str, investor_phone: str) -> int:
+    with _get_conn() as conn:
+        cur = conn.execute("""
+            INSERT INTO investor_units (apt_id, unit_type, floor, layout_name, investor_phone)
+            VALUES (?, ?, ?, ?, ?)
+        """, (apt_id, unit_type, floor, layout_name, investor_phone))
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_investor_units(apt_id: str) -> list[dict]:
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM investor_units WHERE apt_id = ? ORDER BY floor, unit_type, layout_name",
+            (apt_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_investor_unit(unit_id: int) -> dict | None:
+    with _get_conn() as conn:
+        row = conn.execute("SELECT * FROM investor_units WHERE id = ?", (unit_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def delete_investor_unit(unit_id: int) -> None:
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM investor_units WHERE id = ?", (unit_id,))
+        conn.commit()
+
+
+def set_investor_unit_availability(unit_id: int, available: int) -> None:
+    with _get_conn() as conn:
+        conn.execute("UPDATE investor_units SET available = ? WHERE id = ?", (available, unit_id))
+        conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# View analytics
+# ---------------------------------------------------------------------------
+
+def log_view(user_id: int, apt_id: str, detail: str = "") -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO view_analytics (user_id, apt_id, detail) VALUES (?, ?, ?)",
+            (user_id, apt_id, detail),
+        )
+        conn.commit()
+
+
+def get_top_apts_today(n: int = 5) -> list[dict]:
+    with _get_conn() as conn:
+        rows = conn.execute("""
+            SELECT apt_id, COUNT(*) as cnt
+            FROM view_analytics
+            WHERE date(viewed_at) = date('now')
+            GROUP BY apt_id
+            ORDER BY cnt DESC
+            LIMIT ?
+        """, (n,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_layout_views_today(apt_id: str) -> list[dict]:
+    with _get_conn() as conn:
+        rows = conn.execute("""
+            SELECT detail, COUNT(*) as cnt
+            FROM view_analytics
+            WHERE apt_id = ? AND detail != ''
+              AND date(viewed_at) = date('now')
+            GROUP BY detail
+            ORDER BY cnt DESC
+        """, (apt_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Bot settings
+# ---------------------------------------------------------------------------
+
+def get_bot_setting(key: str, default: str = "") -> str:
+    with _get_conn() as conn:
+        row = conn.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_bot_setting(key: str, value: str) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?, ?)",
+            (key, value),
+        )
         conn.commit()

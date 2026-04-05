@@ -475,8 +475,11 @@ async def subprice_cancel(update: Update, _context: ContextTypes.DEFAULT_TYPE) -
     return ConversationHandler.END
 
 
-async def _send_apt_card(msg, apt: dict, admin_user: bool) -> None:
+async def _send_apt_card(msg, apt: dict, admin_user: bool, user_id: int = 0) -> None:
     """Send one apartment card as a photo (or text fallback)."""
+    if user_id:
+        db.log_view(user_id, apt["id"])
+
     floor_prices = apt.get("floor_prices")
     if floor_prices and len(floor_prices) > 1:
         price_lines = "\n".join(f"  {fp['range']} эт.: {fmt(fp['price'])} руб/м²" for fp in floor_prices)
@@ -484,11 +487,13 @@ async def _send_apt_card(msg, apt: dict, admin_user: bool) -> None:
     else:
         price_display = f"{fmt(apt['price_per_sqm'])} руб/м²"
 
-    inst_price = apt.get("installment_price_per_sqm")
-    inst_line  = f"\nВ рассрочку: {fmt(inst_price)} руб/м²" if inst_price else ""
+    inst_price  = apt.get("installment_price_per_sqm")
+    inst_line   = f"\nВ рассрочку: {fmt(inst_price)} руб/м²" if inst_price else ""
+    avail_mark  = "" if apt.get("available", 1) else "\n\n❌ *НЕТ В НАЛИЧИИ*"
     caption = f"*{apt['name']}*\n\nАдрес: {apt['address']}\nЦена за м²: {price_display}{inst_line}"
     if apt.get("description"):
         caption += f"\n\n{apt['description']}"
+    caption += avail_mark
 
     keyboard = []
     file_ids = apt.get("photos_file_ids") or []
@@ -504,6 +509,14 @@ async def _send_apt_card(msg, apt: dict, admin_user: bool) -> None:
     keyboard.append([InlineKeyboardButton("Условия рассрочки", callback_data=f"inst|{apt['id']}")])
     if db.get_calculator(apt["id"]):
         keyboard.append([InlineKeyboardButton("Калькулятор рассрочки", callback_data=f"calc|{apt['id']}")])
+    # Commercial section
+    if db.get_commercial(apt["id"]):
+        comm = db.get_commercial(apt["id"])
+        comm_label = "Коммерция" if comm.get("available", 1) else "Коммерция ❌"
+        keyboard.append([InlineKeyboardButton(comm_label, callback_data=f"comm|{apt['id']}")])
+    # Investor properties
+    if db.get_investor_units(apt["id"]):
+        keyboard.append([InlineKeyboardButton("Инвесторские объекты", callback_data=f"inv|{apt['id']}")])
 
     markup = InlineKeyboardMarkup(keyboard)
     try:
@@ -523,7 +536,8 @@ async def search_apartment(update: Update, _context: ContextTypes.DEFAULT_TYPE) 
     if not apt:
         await update.message.reply_text(f'ЖК по запросу "{query}" не найден.\nПопробуйте уточнить название.')
         return
-    await _send_apt_card(update.message, apt, is_admin(update.effective_user.id))
+    uid = update.effective_user.id
+    await _send_apt_card(update.message, apt, is_admin(uid), user_id=uid)
 
 
 async def installment_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -604,6 +618,9 @@ _ADMIN_COMMANDS = [
     BotCommand("addsub",          "Выдать подписку: /addsub <id> <дней>"),
     BotCommand("delsub",          "Удалить подписку: /delsub <id>"),
     BotCommand("subprice",        "Изменить цены тарифов"),
+    BotCommand("investor",        "Добавить инвесторские объекты"),
+    BotCommand("setavail",        "Изменить наличие квартир/коммерции"),
+    BotCommand("reporttime",      "Время отчёта: /reporttime ЧЧ:ММ"),
     BotCommand("cancel",          "Отменить текущее действие"),
 ]
 
@@ -761,7 +778,8 @@ async def browse_apt_callback(update: Update, _context: ContextTypes.DEFAULT_TYP
     if not apt:
         await cq.message.reply_text("ЖК не найден.")
         return
-    await _send_apt_card(cq.message, apt, is_admin(cq.from_user.id))
+    uid = cq.from_user.id
+    await _send_apt_card(cq.message, apt, is_admin(uid), user_id=uid)
 
 
 # ---------------------------------------------------------------------------
@@ -1063,7 +1081,14 @@ async def edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     S_NAME, S_ALIASES, S_DISTRICT, S_ADDRESS, S_PRICE, S_INST_PRICE,
     S_DESC, S_PHOTO, S_PHOTOS, S_LAYOUTS,
     S_CHESS, S_INST, S_CONFIRM,
-) = range(13)
+    S_ASK_COMM, S_COMM_PRICE, S_COMM_INST_PRICE, S_COMM_LAYOUTS, S_COMM_INST,
+) = range(18)
+
+# Investor units conversation
+INV_PICK_APT, INV_PICK_TYPE, INV_FLOOR, INV_LAYOUT, INV_PHONE, INV_MORE = range(110, 116)
+
+# Availability toggle conversation
+SAV_PICK_APT, SAV_PICK_TYPE, SAV_PICK_ITEM = range(120, 123)
 
 SKIP_CB = "post_skip"
 
@@ -1286,6 +1311,84 @@ async def s_chess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def s_inst(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["installment_text"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Есть ли в этом ЖК коммерческие помещения?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Да", callback_data="ask_comm|yes"),
+            InlineKeyboardButton("Нет", callback_data="ask_comm|no"),
+        ]]),
+    )
+    return S_ASK_COMM
+
+
+async def s_ask_comm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cq = update.callback_query
+    await cq.answer()
+    if cq.data == "ask_comm|no":
+        await cq.edit_message_text("Коммерческие помещения: нет")
+        return await _show_post_summary(update.effective_chat, context)
+    await cq.edit_message_text("Добавляем коммерцию.")
+    await update.effective_chat.send_message(
+        "Коммерция — Цена за м².\n\n"
+        "Одна цена: 200000\n"
+        "По этажам: 1-2:200000, 3+:180000"
+    )
+    return S_COMM_PRICE
+
+
+async def s_comm_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    min_price, floor_prices = parse_floor_prices(update.message.text.strip())
+    if not min_price:
+        await update.message.reply_text("Неверный формат. Введите, например: 200000")
+        return S_COMM_PRICE
+    context.user_data["comm_price_per_sqm"] = min_price
+    context.user_data["comm_floor_prices"]  = floor_prices
+    await update.message.reply_text(
+        "Коммерция — Цена в рассрочку за м².\nЕсли нет — нажмите Пропустить:",
+        reply_markup=_skip_btn("comm_skip_inst_price"),
+    )
+    return S_COMM_INST_PRICE
+
+
+async def s_comm_inst_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip().replace(" ", "").replace(",", "")
+    if not raw.isdigit() or int(raw) <= 0:
+        await update.message.reply_text("Введите целое число:")
+        return S_COMM_INST_PRICE
+    context.user_data["comm_inst_price_per_sqm"] = int(raw)
+    await update.message.reply_text(
+        "Коммерция — Ссылка на планировки.\nЕсли нет — введите прочерк (-):"
+    )
+    return S_COMM_LAYOUTS
+
+
+async def s_comm_inst_price_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cq = update.callback_query
+    await cq.answer()
+    context.user_data["comm_inst_price_per_sqm"] = None
+    await cq.edit_message_text("Цена в рассрочку: нет")
+    await update.effective_chat.send_message(
+        "Коммерция — Ссылка на планировки.\nЕсли нет — введите прочерк (-):"
+    )
+    return S_COMM_LAYOUTS
+
+
+async def s_comm_layouts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    context.user_data["comm_layouts_url"] = "" if text == "-" else text
+    await update.message.reply_text(
+        "Коммерция — Условия рассрочки.\nЕсли нет — введите прочерк (-):"
+    )
+    return S_COMM_INST
+
+
+async def s_comm_inst(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    context.user_data["comm_installment_text"] = "" if text == "-" else text
+    return await _show_post_summary(update.effective_chat, context)
+
+
+async def _show_post_summary(chat, context) -> int:
     d = context.user_data
     aliases_str = ", ".join(d.get("aliases", [])) or "нет"
     fp = d.get("floor_prices")
@@ -1293,19 +1396,23 @@ async def s_inst(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         price_str = "по этажам:\n" + "\n".join(f"  {x['range']} эт. — {fmt(x['price'])} руб/м²" for x in fp)
     else:
         price_str = f"{fmt(d['price_per_sqm'])} руб/м²"
+    comm_line = ""
+    if d.get("comm_price_per_sqm"):
+        comm_line = f"\nКоммерция:  {fmt(d['comm_price_per_sqm'])} руб/м²"
     summary = (
         "Проверьте данные:\n\n"
         f"Название:   {d['name']}\n"
         f"Псевдонимы: {aliases_str}\n"
         f"Адрес:      {d['address']}\n"
         f"Цена за м²: {price_str}\n"
-        f"Описание:   {d.get('description') or 'нет'}\n"
+        f"Описание:   {d.get('description') or 'нет'}"
+        f"{comm_line}\n"
     )
     keyboard = [[
-        InlineKeyboardButton("Сохранить",  callback_data="post_save"),
-        InlineKeyboardButton("Отменить",   callback_data="post_discard"),
+        InlineKeyboardButton("Сохранить", callback_data="post_save"),
+        InlineKeyboardButton("Отменить",  callback_data="post_discard"),
     ]]
-    await update.message.reply_text(summary, reply_markup=InlineKeyboardMarkup(keyboard))
+    await chat.send_message(summary, reply_markup=InlineKeyboardMarkup(keyboard))
     return S_CONFIRM
 
 
@@ -1320,6 +1427,15 @@ async def s_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     db.save_apartment(apt_data)
     refresh_index()
     apt_id = apt_data["id"]
+    # Save commercial section if provided
+    if apt_data.get("comm_price_per_sqm"):
+        db.save_commercial(apt_id, {
+            "price_per_sqm":             apt_data["comm_price_per_sqm"],
+            "floor_prices":              apt_data.get("comm_floor_prices"),
+            "installment_text":          apt_data.get("comm_installment_text", ""),
+            "installment_price_per_sqm": apt_data.get("comm_inst_price_per_sqm"),
+            "layouts_url":               apt_data.get("comm_layouts_url", ""),
+        })
     context.user_data.clear()
     keyboard = [[
         InlineKeyboardButton("Настроить калькулятор", callback_data=f"setup_calc|{apt_id}"),
@@ -1337,6 +1453,382 @@ async def post_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     context.user_data.clear()
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Commercial card callback
+# ---------------------------------------------------------------------------
+
+async def comm_card_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    apt_id = cq.data.split("|", 1)[1]
+    comm = db.get_commercial(apt_id)
+    if not comm:
+        await cq.message.reply_text("Коммерческие помещения не найдены.")
+        return
+    db.log_view(cq.from_user.id, apt_id, "commercial")
+    fp = comm.get("floor_prices")
+    if fp and len(fp) > 1:
+        price_lines = "\n".join(f"  {x['range']} эт.: {fmt(x['price'])} руб/м²" for x in fp)
+        price_display = f"от {fmt(comm['price_per_sqm'])} руб/м²\n{price_lines}"
+    else:
+        price_display = f"{fmt(comm['price_per_sqm'])} руб/м²"
+    inst_p = comm.get("installment_price_per_sqm")
+    inst_line = f"\nВ рассрочку: {fmt(inst_p)} руб/м²" if inst_p else ""
+    avail_mark = "" if comm.get("available", 1) else "\n\n❌ *НЕТ В НАЛИЧИИ*"
+    caption = f"*Коммерческие помещения*\n\nЦена за м²: {price_display}{inst_line}{avail_mark}"
+    keyboard = []
+    if is_valid_url(comm.get("layouts_url", "")):
+        keyboard.append([InlineKeyboardButton("Планировки", url=comm["layouts_url"])])
+    if comm.get("installment_text"):
+        keyboard.append([InlineKeyboardButton("Условия рассрочки", callback_data=f"comm_inst|{apt_id}")])
+    await cq.message.reply_text(caption, parse_mode="Markdown",
+                                 reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+
+
+async def comm_inst_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    apt_id = cq.data.split("|", 1)[1]
+    comm = db.get_commercial(apt_id)
+    if not comm:
+        return
+    await cq.message.reply_text(
+        f"*Условия рассрочки — Коммерция*\n\n{comm.get('installment_text', '')}",
+        parse_mode="Markdown",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Investor units callbacks
+# ---------------------------------------------------------------------------
+
+async def inv_floors_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    apt_id = cq.data.split("|", 1)[1]
+    units  = db.get_investor_units(apt_id)
+    if not units:
+        await cq.message.reply_text("Инвесторских объектов нет.")
+        return
+    floors = sorted({u["floor"] for u in units})
+    keyboard = [[InlineKeyboardButton(f"Этаж {f}", callback_data=f"inv_f|{apt_id}|{f}")] for f in floors]
+    await cq.message.reply_text("Выберите этаж:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def inv_floor_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    _, apt_id, floor_s = cq.data.split("|")
+    floor = int(floor_s)
+    units = [u for u in db.get_investor_units(apt_id) if u["floor"] == floor]
+    if not units:
+        await cq.message.reply_text("Объекты не найдены.")
+        return
+    keyboard = []
+    for u in units:
+        type_label = "Кв." if u["unit_type"] == "apt" else "Ком."
+        avail = "" if u["available"] else " ❌"
+        keyboard.append([InlineKeyboardButton(
+            f"{type_label} {u['layout_name']}{avail}",
+            callback_data=f"inv_u|{u['id']}"
+        )])
+    await cq.message.reply_text(f"Этаж {floor} — выберите объект:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def inv_unit_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    unit_id = int(cq.data.split("|", 1)[1])
+    u = db.get_investor_unit(unit_id)
+    if not u:
+        await cq.message.reply_text("Объект не найден.")
+        return
+    type_label = "Квартира" if u["unit_type"] == "apt" else "Коммерция"
+    avail_mark = "" if u["available"] else "\n\n❌ *НЕТ В НАЛИЧИИ*"
+    text = (
+        f"*{type_label} — Этаж {u['floor']}*\n"
+        f"Планировка: {u['layout_name']}\n"
+        f"Телефон инвестора: `{u['investor_phone']}`"
+        f"{avail_mark}"
+    )
+    await cq.message.reply_text(text, parse_mode="Markdown")
+
+
+# ---------------------------------------------------------------------------
+# Admin: /investor — add investor units
+# ---------------------------------------------------------------------------
+
+async def investor_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    apts = db.get_all_apartments()
+    if not apts:
+        await update.message.reply_text("Список ЖК пуст.")
+        return ConversationHandler.END
+    context.user_data.clear()
+    keyboard = [[InlineKeyboardButton(a["name"], callback_data=f"inv_apt|{a['id']}")] for a in apts]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="inv_apt|cancel")])
+    await update.message.reply_text("Выберите ЖК:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return INV_PICK_APT
+
+
+async def inv_pick_apt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cq = update.callback_query
+    await cq.answer()
+    if cq.data == "inv_apt|cancel":
+        await cq.edit_message_text("Отменено.")
+        return ConversationHandler.END
+    apt_id = cq.data.split("|", 1)[1]
+    context.user_data["inv_apt_id"] = apt_id
+    has_comm = db.get_commercial(apt_id) is not None
+    keyboard = [[InlineKeyboardButton("Квартира", callback_data="inv_type|apt")]]
+    if has_comm:
+        keyboard.append([InlineKeyboardButton("Коммерция", callback_data="inv_type|comm")])
+    await cq.edit_message_text("Тип объекта:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return INV_PICK_TYPE
+
+
+async def inv_pick_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cq = update.callback_query
+    await cq.answer()
+    context.user_data["inv_unit_type"] = cq.data.split("|", 1)[1]
+    await cq.edit_message_text("Введите номер этажа:")
+    return INV_FLOOR
+
+
+async def inv_floor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("Введите число:")
+        return INV_FLOOR
+    context.user_data["inv_floor"] = int(text)
+    await update.message.reply_text("Введите название планировки (например: 2-комн или 42м²):")
+    return INV_LAYOUT
+
+
+async def inv_layout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["inv_layout"] = update.message.text.strip()
+    await update.message.reply_text("Введите номер телефона инвестора:")
+    return INV_PHONE
+
+
+async def inv_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["inv_phone"] = update.message.text.strip()
+    d = context.user_data
+    db.add_investor_unit(
+        d["inv_apt_id"], d["inv_unit_type"], d["inv_floor"],
+        d["inv_layout"], d["inv_phone"],
+    )
+    type_label = "Квартира" if d["inv_unit_type"] == "apt" else "Коммерция"
+    await update.message.reply_text(
+        f"Объект добавлен: {type_label}, эт. {d['inv_floor']}, {d['inv_layout']}",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Добавить ещё", callback_data="inv_more|yes"),
+            InlineKeyboardButton("Готово",       callback_data="inv_more|no"),
+        ]]),
+    )
+    return INV_MORE
+
+
+async def inv_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cq = update.callback_query
+    await cq.answer()
+    if cq.data == "inv_more|no":
+        await cq.edit_message_text("Инвесторские объекты сохранены.")
+        return ConversationHandler.END
+    has_comm = db.get_commercial(context.user_data["inv_apt_id"]) is not None
+    keyboard = [[InlineKeyboardButton("Квартира", callback_data="inv_type|apt")]]
+    if has_comm:
+        keyboard.append([InlineKeyboardButton("Коммерция", callback_data="inv_type|comm")])
+    await cq.edit_message_text("Тип объекта:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return INV_PICK_TYPE
+
+
+async def investor_cancel(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Admin: /setavail — toggle availability
+# ---------------------------------------------------------------------------
+
+async def setavail_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    apts = db.get_all_apartments()
+    if not apts:
+        await update.message.reply_text("Список ЖК пуст.")
+        return ConversationHandler.END
+    context.user_data.clear()
+    keyboard = [[InlineKeyboardButton(a["name"], callback_data=f"sav_apt|{a['id']}")] for a in apts]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="sav_apt|cancel")])
+    await update.message.reply_text("Выберите ЖК:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return SAV_PICK_APT
+
+
+async def sav_pick_apt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cq = update.callback_query
+    await cq.answer()
+    if cq.data == "sav_apt|cancel":
+        await cq.edit_message_text("Отменено.")
+        return ConversationHandler.END
+    apt_id = cq.data.split("|", 1)[1]
+    context.user_data["sav_apt_id"] = apt_id
+    apts = db.get_all_apartments()
+    apt  = next((a for a in apts if a["id"] == apt_id), None)
+    has_comm = db.get_commercial(apt_id) is not None
+    units = db.get_investor_units(apt_id)
+    apt_mark  = "" if apt and apt.get("available", 1) else " ❌"
+    comm_mark = ""
+    if has_comm:
+        c = db.get_commercial(apt_id)
+        comm_mark = "" if c and c.get("available", 1) else " ❌"
+    keyboard = [[InlineKeyboardButton(f"Квартиры{apt_mark}", callback_data="sav_type|apt")]]
+    if has_comm:
+        keyboard.append([InlineKeyboardButton(f"Коммерция{comm_mark}", callback_data="sav_type|comm")])
+    if units:
+        keyboard.append([InlineKeyboardButton("Инвесторские объекты", callback_data="sav_type|inv")])
+    await cq.edit_message_text("Что меняем?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return SAV_PICK_TYPE
+
+
+async def sav_pick_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cq = update.callback_query
+    await cq.answer()
+    apt_id   = context.user_data["sav_apt_id"]
+    sav_type = cq.data.split("|", 1)[1]
+    if sav_type == "apt":
+        apts = db.get_all_apartments()
+        apt  = next((a for a in apts if a["id"] == apt_id), None)
+        cur  = apt.get("available", 1) if apt else 1
+        new  = 0 if cur else 1
+        db.set_apartment_availability(apt_id, new)
+        label = "в наличии" if new else "НЕТ В НАЛИЧИИ"
+        await cq.edit_message_text(f"Квартиры: {label}")
+        return ConversationHandler.END
+    if sav_type == "comm":
+        comm = db.get_commercial(apt_id)
+        cur  = comm.get("available", 1) if comm else 1
+        new  = 0 if cur else 1
+        db.set_commercial_availability(apt_id, new)
+        label = "в наличии" if new else "НЕТ В НАЛИЧИИ"
+        await cq.edit_message_text(f"Коммерция: {label}")
+        return ConversationHandler.END
+    # Investor units
+    units = db.get_investor_units(apt_id)
+    keyboard = []
+    for u in units:
+        type_l = "Кв." if u["unit_type"] == "apt" else "Ком."
+        avail  = "" if u["available"] else " ❌"
+        keyboard.append([InlineKeyboardButton(
+            f"Эт.{u['floor']} {type_l} {u['layout_name']}{avail}",
+            callback_data=f"sav_inv|{u['id']}"
+        )])
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="sav_inv|cancel")])
+    await cq.edit_message_text("Выберите объект:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return SAV_PICK_ITEM
+
+
+async def sav_pick_item(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cq = update.callback_query
+    await cq.answer()
+    if cq.data == "sav_inv|cancel":
+        await cq.edit_message_text("Отменено.")
+        return ConversationHandler.END
+    unit_id = int(cq.data.split("|", 1)[1])
+    u   = db.get_investor_unit(unit_id)
+    cur = u.get("available", 1) if u else 1
+    new = 0 if cur else 1
+    db.set_investor_unit_availability(unit_id, new)
+    label = "в наличии" if new else "НЕТ В НАЛИЧИИ"
+    await cq.edit_message_text(f"Объект: {label}")
+    return ConversationHandler.END
+
+
+async def setavail_cancel(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Analytics daily report + /reporttime
+# ---------------------------------------------------------------------------
+
+async def reporttime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    args = context.args
+    if not args or len(args[0]) != 5 or args[0][2] != ":":
+        await update.message.reply_text("Использование: /reporttime ЧЧ:ММ\nНапример: /reporttime 10:00")
+        return
+    time_str = args[0]
+    try:
+        h, m = int(time_str[:2]), int(time_str[3:])
+        assert 0 <= h <= 23 and 0 <= m <= 59
+    except Exception:
+        await update.message.reply_text("Неверный формат. Пример: /reporttime 10:00")
+        return
+    db.set_bot_setting("report_time", time_str)
+    # Reschedule the job
+    _reschedule_report(context.application, update.effective_user.id)
+    await update.message.reply_text(f"Время ежедневного отчёта установлено: {time_str}")
+
+
+def _reschedule_report(application, admin_id: int | None = None) -> None:
+    jq = application.job_queue
+    # Remove existing
+    for job in jq.get_jobs_by_name("daily_report"):
+        job.schedule_removal()
+    time_str = db.get_bot_setting("report_time", "10:00")
+    h, m = int(time_str[:2]), int(time_str[3:])
+    import datetime as _dt
+    jq.run_daily(
+        _send_daily_report,
+        time=_dt.time(h, m, tzinfo=_dt.timezone.utc),
+        name="daily_report",
+    )
+
+
+async def _send_daily_report(context) -> None:
+    top = db.get_top_apts_today(5)
+    if not top:
+        return
+    apts_map = {a["id"]: a["name"] for a in db.get_all_apartments()}
+    lines = ["*Топ-5 самых запрашиваемых ЖК сегодня:*\n"]
+    keyboard = []
+    for i, row in enumerate(top, 1):
+        name = apts_map.get(row["apt_id"], row["apt_id"])
+        lines.append(f"{i}. *{name}* — {row['cnt']} просмотров")
+        keyboard.append([InlineKeyboardButton(name, callback_data=f"anl|{row['apt_id']}")])
+    text = "\n".join(lines)
+    # Send to all admins
+    for admin_id in _ENV_ADMINS | _db_admins:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id, text=text,
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception:
+            pass
+
+
+async def analytics_apt_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    apt_id   = cq.data.split("|", 1)[1]
+    apts_map = {a["id"]: a["name"] for a in db.get_all_apartments()}
+    name     = apts_map.get(apt_id, apt_id)
+    layouts  = db.get_layout_views_today(apt_id)
+    lines    = [f"*{name}* — просмотры планировок сегодня:\n"]
+    if layouts:
+        for r in layouts:
+            lines.append(f"• {r['detail']} — {r['cnt']} раз")
+    else:
+        lines.append("Нет данных по планировкам.")
+    await cq.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -2502,6 +2994,14 @@ def main() -> None:
             S_LAYOUTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, s_layouts)],
             S_CHESS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, s_chess)],
             S_INST:    [MessageHandler(filters.TEXT & ~filters.COMMAND, s_inst)],
+            S_ASK_COMM:       [CallbackQueryHandler(s_ask_comm,           pattern=r"^ask_comm\|")],
+            S_COMM_PRICE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, s_comm_price)],
+            S_COMM_INST_PRICE:[
+                MessageHandler(filters.TEXT & ~filters.COMMAND, s_comm_inst_price),
+                CallbackQueryHandler(s_comm_inst_price_skip, pattern=r"^comm_skip_inst_price$"),
+            ],
+            S_COMM_LAYOUTS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, s_comm_layouts)],
+            S_COMM_INST:      [MessageHandler(filters.TEXT & ~filters.COMMAND, s_comm_inst)],
             S_CONFIRM: [CallbackQueryHandler(s_confirm, pattern=r"^post_(save|discard)$")],
         },
         fallbacks=[CommandHandler("cancel", post_cancel)],
@@ -2623,6 +3123,31 @@ def main() -> None:
         per_message=False,
     )
 
+    investor_conv = ConversationHandler(
+        entry_points=[CommandHandler("investor", investor_cmd)],
+        states={
+            INV_PICK_APT:  [CallbackQueryHandler(inv_pick_apt,  pattern=r"^inv_apt\|")],
+            INV_PICK_TYPE: [CallbackQueryHandler(inv_pick_type, pattern=r"^inv_type\|")],
+            INV_FLOOR:     [MessageHandler(filters.TEXT & ~filters.COMMAND, inv_floor)],
+            INV_LAYOUT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, inv_layout)],
+            INV_PHONE:     [MessageHandler(filters.TEXT & ~filters.COMMAND, inv_phone)],
+            INV_MORE:      [CallbackQueryHandler(inv_more, pattern=r"^inv_more\|")],
+        },
+        fallbacks=[CommandHandler("cancel", investor_cancel)],
+        per_message=False,
+    )
+
+    setavail_conv = ConversationHandler(
+        entry_points=[CommandHandler("setavail", setavail_cmd)],
+        states={
+            SAV_PICK_APT:  [CallbackQueryHandler(sav_pick_apt,  pattern=r"^sav_apt\|")],
+            SAV_PICK_TYPE: [CallbackQueryHandler(sav_pick_type, pattern=r"^sav_type\|")],
+            SAV_PICK_ITEM: [CallbackQueryHandler(sav_pick_item, pattern=r"^sav_inv\|")],
+        },
+        fallbacks=[CommandHandler("cancel", setavail_cancel)],
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler("start",          start))
     app.add_handler(CommandHandler("subscribe",      subscribe_cmd))
     app.add_handler(CommandHandler("list",           list_cmd))
@@ -2637,17 +3162,26 @@ def main() -> None:
     app.add_handler(CommandHandler("subscribers",    subscribers_cmd))
     app.add_handler(CommandHandler("addsub",         addsub_cmd))
     app.add_handler(CommandHandler("delsub",         delsub_cmd))
+    app.add_handler(CommandHandler("reporttime",     reporttime_cmd))
     app.add_handler(post_conv)
     app.add_handler(edit_conv)
     app.add_handler(calc_setup_conv)
     app.add_handler(setcount_conv)
     app.add_handler(user_calc_conv)
     app.add_handler(subprice_conv)
+    app.add_handler(investor_conv)
+    app.add_handler(setavail_conv)
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
-    app.add_handler(CallbackQueryHandler(sub_plans_callback,    pattern=r"^sub_plans$"))
-    app.add_handler(CallbackQueryHandler(sub_plan_callback,     pattern=r"^sub\|"))
+    app.add_handler(CallbackQueryHandler(sub_plans_callback,      pattern=r"^sub_plans$"))
+    app.add_handler(CallbackQueryHandler(sub_plan_callback,       pattern=r"^sub\|"))
     app.add_handler(CallbackQueryHandler(sub_pay_method_callback, pattern=r"^subpay\|"))
+    app.add_handler(CallbackQueryHandler(comm_card_callback,      pattern=r"^comm\|"))
+    app.add_handler(CallbackQueryHandler(comm_inst_callback,      pattern=r"^comm_inst\|"))
+    app.add_handler(CallbackQueryHandler(inv_floors_callback,     pattern=r"^inv\|"))
+    app.add_handler(CallbackQueryHandler(inv_floor_callback,      pattern=r"^inv_f\|"))
+    app.add_handler(CallbackQueryHandler(inv_unit_callback,       pattern=r"^inv_u\|"))
+    app.add_handler(CallbackQueryHandler(analytics_apt_callback,  pattern=r"^anl\|"))
     app.add_handler(CallbackQueryHandler(del_ask_callback,    pattern=r"^del_ask\|"))
     app.add_handler(CallbackQueryHandler(del_yes_callback,    pattern=r"^del_yes\|"))
     app.add_handler(CallbackQueryHandler(del_cancel_callback, pattern=r"^del_cancel$"))
@@ -2659,6 +3193,9 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(browse_back_callback,     pattern=r"^br_back$"))
     app.add_handler(CallbackQueryHandler(removedistrict_callback,  pattern=r"^(rmd\||rmd_cancel$)"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_apartment))
+
+    # Schedule daily analytics report
+    _reschedule_report(app)
 
     logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
