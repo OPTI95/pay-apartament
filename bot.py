@@ -245,6 +245,15 @@ def _skip_btn(callback: str) -> InlineKeyboardMarkup:
 # User handlers
 # ---------------------------------------------------------------------------
 
+async def myid_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    admin = is_admin(uid)
+    await update.message.reply_text(
+        f"Твой Telegram ID: `{uid}`\nАдмин: {'да' if admin else 'нет'}",
+        parse_mode="Markdown",
+    )
+
+
 async def start(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Добро пожаловать!\n\n"
@@ -3004,7 +3013,9 @@ def main() -> None:
             ],
             scope=BotCommandScopeDefault(),
         )
+        logger.info("ENV admins: %s", _ENV_ADMINS)
         for admin_id in _ENV_ADMINS | _db_admins:
+            logger.info("Setting admin commands for %d", admin_id)
             await _set_admin_commands(application.bot, admin_id)
 
     app = Application.builder().token(TOKEN).post_init(post_init).build()
@@ -3191,6 +3202,7 @@ def main() -> None:
         per_message=False,
     )
 
+    app.add_handler(CommandHandler("myid",           myid_cmd))
     app.add_handler(CommandHandler("start",          start))
     app.add_handler(CommandHandler("subscribe",      subscribe_cmd))
     app.add_handler(CommandHandler("list",           list_cmd))
