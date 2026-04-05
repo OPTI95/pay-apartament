@@ -2,12 +2,13 @@ import asyncio
 import os
 import re
 import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, LabeledPrice
 from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, filters, ContextTypes,
+    ConversationHandler, filters, ContextTypes, PreCheckoutQueryHandler,
 )
 from rapidfuzz import process, fuzz
 import database as db
@@ -30,6 +31,50 @@ def refresh_admins() -> None:
 
 def is_admin(user_id: int) -> bool:
     return user_id in _ENV_ADMINS or user_id in _db_admins
+
+
+# ---------------------------------------------------------------------------
+# Subscription plans
+# ---------------------------------------------------------------------------
+
+PLANS = {
+    "1m": {"label": "1 месяц",   "stars": 299,  "months": 1},
+    "3m": {"label": "3 месяца",  "stars": 807,  "months": 3},
+    "6m": {"label": "6 месяцев", "stars": 1524, "months": 6},
+}
+
+
+async def _show_plans(msg) -> None:
+    text = (
+        "Подписка открывает доступ к базе ЖК.\n\n"
+        "Тарифы (оплата Telegram Stars ⭐):\n"
+        "• 1 месяц — 299 ⭐\n"
+        "• 3 месяца — 807 ⭐ (скидка 10%)\n"
+        "• 6 месяцев — 1 524 ⭐ (скидка 15%)\n\n"
+        "Выберите тариф:"
+    )
+    keyboard = [
+        [InlineKeyboardButton("1 месяц — 299 ⭐",    callback_data="sub|1m")],
+        [InlineKeyboardButton("3 месяца — 807 ⭐",   callback_data="sub|3m")],
+        [InlineKeyboardButton("6 месяцев — 1 524 ⭐", callback_data="sub|6m")],
+    ]
+    await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def _require_sub(update: Update) -> bool:
+    """Returns True if user may proceed; sends paywall message otherwise."""
+    user_id = update.effective_user.id
+    if is_admin(user_id) or db.get_active_subscription(user_id):
+        return True
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Оформить подписку", callback_data="sub_plans"),
+    ]])
+    text = "Для доступа к базе ЖК необходима подписка.\n\nНажмите кнопку ниже, чтобы выбрать тариф."
+    if update.message:
+        await update.message.reply_text(text, reply_markup=keyboard)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(text, reply_markup=keyboard)
+    return False
 
 
 logging.basicConfig(
@@ -169,7 +214,66 @@ async def start(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Добро пожаловать!\n\n"
         "Напишите название ЖК — я найду его даже с опечаткой.\n\n"
-        "Например: АН НУР, Классика, анур..."
+        "Например: АН НУР, Классика, анур...\n\n"
+        "Для доступа к базе нужна подписка — /subscribe"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subscription handlers
+# ---------------------------------------------------------------------------
+
+async def subscribe_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    sub = db.get_active_subscription(user_id)
+    if sub:
+        expires = datetime.fromisoformat(sub["expires_at"]).strftime("%d.%m.%Y")
+        await update.message.reply_text(
+            f"У вас уже есть активная подписка (тариф «{sub['plan']}»).\n"
+            f"Действует до: {expires}"
+        )
+        return
+    await _show_plans(update.message)
+
+
+async def sub_plans_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    await _show_plans(cq.message)
+
+
+async def sub_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    plan_key = cq.data.split("|", 1)[1]
+    plan = PLANS.get(plan_key)
+    if not plan:
+        return
+    await context.bot.send_invoice(
+        chat_id=cq.from_user.id,
+        title=f"Подписка — {plan['label']}",
+        description=f"Доступ к базе ЖК на {plan['label']}",
+        payload=f"sub|{plan_key}",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label=plan["label"], amount=plan["stars"])],
+    )
+
+
+async def precheckout_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.pre_checkout_query.answer(ok=True)
+
+
+async def successful_payment_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    payment = update.message.successful_payment
+    payload_parts = payment.invoice_payload.split("|")
+    plan_key = payload_parts[1] if len(payload_parts) > 1 else "1m"
+    plan = PLANS.get(plan_key, PLANS["1m"])
+    user_id = update.effective_user.id
+    expires_at = datetime.utcnow() + timedelta(days=30 * plan["months"])
+    db.save_subscription(user_id, plan["label"], expires_at.isoformat(), payment.telegram_payment_charge_id)
+    await update.message.reply_text(
+        f"Оплата прошла! Подписка активна до {expires_at.strftime('%d.%m.%Y')}."
     )
 
 
@@ -214,6 +318,8 @@ async def _send_apt_card(msg, apt: dict, admin_user: bool) -> None:
 
 
 async def search_apartment(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_sub(update):
+        return
     query = update.message.text.strip()
     apt = find_apartment(query)
     if not apt:
@@ -259,6 +365,8 @@ async def aptphotos_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE
 # ---------------------------------------------------------------------------
 
 async def list_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_sub(update):
+        return
     apts = db.get_all_apartments()
     if not apts:
         await update.message.reply_text("Список ЖК пуст.")
@@ -280,6 +388,7 @@ async def list_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
 
 _ADMIN_COMMANDS = [
     BotCommand("start",           "Начать / помощь"),
+    BotCommand("subscribe",       "Оформить подписку"),
     BotCommand("post",            "Добавить новый ЖК"),
     BotCommand("edit",            "Редактировать ЖК"),
     BotCommand("delete",          "Удалить ЖК"),
@@ -406,6 +515,8 @@ async def listdistricts_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE)
 # ---------------------------------------------------------------------------
 
 async def browse_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_sub(update):
+        return
     districts = db.get_all_districts()
     if not districts:
         await update.message.reply_text("Районы ещё не добавлены.")
@@ -2149,9 +2260,10 @@ def main() -> None:
     async def post_init(application) -> None:
         await application.bot.set_my_commands(
             [
-                BotCommand("start",  "Начать / помощь"),
-                BotCommand("list",   "Список всех ЖК"),
-                BotCommand("browse", "Подбор ЖК по районам"),
+                BotCommand("start",     "Начать / помощь"),
+                BotCommand("subscribe", "Оформить подписку"),
+                BotCommand("list",     "Список всех ЖК"),
+                BotCommand("browse",   "Подбор ЖК по районам"),
             ],
             scope=BotCommandScopeDefault(),
         )
@@ -2299,6 +2411,7 @@ def main() -> None:
     )
 
     app.add_handler(CommandHandler("start",          start))
+    app.add_handler(CommandHandler("subscribe",      subscribe_cmd))
     app.add_handler(CommandHandler("list",           list_cmd))
     app.add_handler(CommandHandler("browse",         browse_cmd))
     app.add_handler(CommandHandler("delete",         delete_cmd))
@@ -2313,6 +2426,10 @@ def main() -> None:
     app.add_handler(calc_setup_conv)
     app.add_handler(setcount_conv)
     app.add_handler(user_calc_conv)
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+    app.add_handler(CallbackQueryHandler(sub_plans_callback, pattern=r"^sub_plans$"))
+    app.add_handler(CallbackQueryHandler(sub_plan_callback,  pattern=r"^sub\|"))
     app.add_handler(CallbackQueryHandler(del_ask_callback,    pattern=r"^del_ask\|"))
     app.add_handler(CallbackQueryHandler(del_yes_callback,    pattern=r"^del_yes\|"))
     app.add_handler(CallbackQueryHandler(del_cancel_callback, pattern=r"^del_cancel$"))

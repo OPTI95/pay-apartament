@@ -44,6 +44,14 @@ def init_db() -> None:
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id    INTEGER PRIMARY KEY,
+                plan       TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                charge_id  TEXT
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS districts (
                 id   INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL
@@ -256,3 +264,25 @@ def get_apartments_by_district(district_id: int) -> list[dict]:
         apt["photos_file_ids"] = json.loads(apt["photos_file_ids"]) if apt.get("photos_file_ids") else []
         result.append(apt)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Subscriptions
+# ---------------------------------------------------------------------------
+
+def save_subscription(user_id: int, plan: str, expires_at: str, charge_id: str) -> None:
+    with _get_conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO subscriptions (user_id, plan, expires_at, charge_id)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, plan, expires_at, charge_id))
+        conn.commit()
+
+
+def get_active_subscription(user_id: int) -> dict | None:
+    with _get_conn() as conn:
+        row = conn.execute("""
+            SELECT * FROM subscriptions
+            WHERE user_id = ? AND expires_at > CURRENT_TIMESTAMP
+        """, (user_id,)).fetchone()
+    return dict(row) if row else None
