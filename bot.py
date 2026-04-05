@@ -601,6 +601,7 @@ async def list_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
 _ADMIN_COMMANDS = [
     BotCommand("start",           "Начать / помощь"),
     BotCommand("subscribe",       "Статус подписки"),
+    BotCommand("top",             "Топ популярных ЖК сегодня"),
     BotCommand("post",            "Добавить новый ЖК"),
     BotCommand("edit",            "Редактировать ЖК"),
     BotCommand("delete",          "Удалить ЖК"),
@@ -1816,6 +1817,7 @@ async def _send_daily_report(context) -> None:
 
 
 async def analytics_apt_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: tap ЖК in daily report → layout breakdown."""
     cq = update.callback_query
     await cq.answer()
     apt_id   = cq.data.split("|", 1)[1]
@@ -1829,6 +1831,46 @@ async def analytics_apt_callback(update: Update, _context: ContextTypes.DEFAULT_
     else:
         lines.append("Нет данных по планировкам.")
     await cq.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def top_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User-facing: show top-5 most viewed ЖК today with open buttons."""
+    if not await _require_sub(update):
+        return
+    top = db.get_top_apts_today(5)
+    apts_map = {a["id"]: a for a in db.get_all_apartments()}
+    if not top:
+        await update.message.reply_text("Сегодня ещё нет данных о просмотрах.")
+        return
+    lines = ["*Топ-5 самых популярных ЖК сегодня:*\n"]
+    keyboard = []
+    for i, row in enumerate(top, 1):
+        apt = apts_map.get(row["apt_id"])
+        if not apt:
+            continue
+        avail = "" if apt.get("available", 1) else " ❌"
+        lines.append(f"{i}. *{apt['name']}*{avail} — {row['cnt']} просмотров")
+        keyboard.append([InlineKeyboardButton(
+            f"{i}. {apt['name']}{avail}",
+            callback_data=f"top_open|{apt['id']}"
+        )])
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def top_open_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open ЖК card from /top list."""
+    cq = update.callback_query
+    await cq.answer()
+    apt_id = cq.data.split("|", 1)[1]
+    apt    = next((a for a in db.get_all_apartments() if a["id"] == apt_id), None)
+    if not apt:
+        await cq.message.reply_text("ЖК не найден.")
+        return
+    uid = cq.from_user.id
+    await _send_apt_card(cq.message, apt, is_admin(uid), user_id=uid)
 
 
 # ---------------------------------------------------------------------------
@@ -2958,6 +3000,7 @@ def main() -> None:
                 BotCommand("subscribe", "Оформить подписку"),
                 BotCommand("list",     "Список всех ЖК"),
                 BotCommand("browse",   "Подбор ЖК по районам"),
+                BotCommand("top",      "Топ популярных ЖК сегодня"),
             ],
             scope=BotCommandScopeDefault(),
         )
@@ -3163,6 +3206,7 @@ def main() -> None:
     app.add_handler(CommandHandler("addsub",         addsub_cmd))
     app.add_handler(CommandHandler("delsub",         delsub_cmd))
     app.add_handler(CommandHandler("reporttime",     reporttime_cmd))
+    app.add_handler(CommandHandler("top",            top_cmd))
     app.add_handler(post_conv)
     app.add_handler(edit_conv)
     app.add_handler(calc_setup_conv)
@@ -3182,6 +3226,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(inv_floor_callback,      pattern=r"^inv_f\|"))
     app.add_handler(CallbackQueryHandler(inv_unit_callback,       pattern=r"^inv_u\|"))
     app.add_handler(CallbackQueryHandler(analytics_apt_callback,  pattern=r"^anl\|"))
+    app.add_handler(CallbackQueryHandler(top_open_callback,       pattern=r"^top_open\|"))
     app.add_handler(CallbackQueryHandler(del_ask_callback,    pattern=r"^del_ask\|"))
     app.add_handler(CallbackQueryHandler(del_yes_callback,    pattern=r"^del_yes\|"))
     app.add_handler(CallbackQueryHandler(del_cancel_callback, pattern=r"^del_cancel$"))
