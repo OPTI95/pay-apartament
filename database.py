@@ -52,6 +52,13 @@ def init_db() -> None:
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS subscription_plans (
+                plan_key   TEXT PRIMARY KEY,
+                price_rub  INTEGER NOT NULL,
+                price_stars INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS districts (
                 id   INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT UNIQUE NOT NULL
@@ -286,3 +293,72 @@ def get_active_subscription(user_id: int) -> dict | None:
             WHERE user_id = ? AND expires_at > CURRENT_TIMESTAMP
         """, (user_id,)).fetchone()
     return dict(row) if row else None
+
+
+def delete_subscription(user_id: int) -> None:
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def extend_subscription(user_id: int, days: int, plan: str = "ручная") -> None:
+    """Add days to existing subscription or create a new one from now."""
+    from datetime import datetime, timedelta
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT expires_at FROM subscriptions WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row:
+            try:
+                base = datetime.fromisoformat(row["expires_at"])
+                # If already expired, start from now
+                if base < datetime.utcnow():
+                    base = datetime.utcnow()
+            except Exception:
+                base = datetime.utcnow()
+        else:
+            base = datetime.utcnow()
+        new_expiry = (base + timedelta(days=days)).isoformat()
+        conn.execute("""
+            INSERT OR REPLACE INTO subscriptions (user_id, plan, expires_at, charge_id)
+            VALUES (?, ?, ?, NULL)
+        """, (user_id, plan, new_expiry))
+        conn.commit()
+
+
+def get_all_active_subscriptions() -> list[dict]:
+    with _get_conn() as conn:
+        rows = conn.execute("""
+            SELECT * FROM subscriptions
+            WHERE expires_at > CURRENT_TIMESTAMP
+            ORDER BY expires_at
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Subscription plan prices
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PRICES = {
+    "1m": (299,  299),
+    "3m": (807,  807),
+    "6m": (1525, 1525),
+}
+
+
+def get_plan_prices() -> dict[str, tuple[int, int]]:
+    """Returns {plan_key: (price_rub, price_stars)}."""
+    with _get_conn() as conn:
+        rows = conn.execute("SELECT plan_key, price_rub, price_stars FROM subscription_plans").fetchall()
+    stored = {r["plan_key"]: (r["price_rub"], r["price_stars"]) for r in rows}
+    return {k: stored.get(k, v) for k, v in _DEFAULT_PRICES.items()}
+
+
+def update_plan_prices(plan_key: str, price_rub: int, price_stars: int) -> None:
+    with _get_conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO subscription_plans (plan_key, price_rub, price_stars)
+            VALUES (?, ?, ?)
+        """, (plan_key, price_rub, price_stars))
+        conn.commit()

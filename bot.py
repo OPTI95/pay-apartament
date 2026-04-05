@@ -15,6 +15,7 @@ import database as db
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN", "")  # YooKassa / Sberbank token from BotFather
 # Admins from .env are permanent super-admins; additional admins stored in DB
 _ENV_ADMINS: set[int] = set(
     int(x.strip())
@@ -37,28 +38,62 @@ def is_admin(user_id: int) -> bool:
 # Subscription plans
 # ---------------------------------------------------------------------------
 
-PLANS = {
-    "1m": {"label": "1 месяц",   "stars": 299,  "months": 1},
-    "3m": {"label": "3 месяца",  "stars": 807,  "months": 3},
-    "6m": {"label": "6 месяцев", "stars": 1524, "months": 6},
+_PLAN_META = {
+    "1m": {"label": "1 месяц",   "months": 1, "discount": 0},
+    "3m": {"label": "3 месяца",  "months": 3, "discount": 10},
+    "6m": {"label": "6 месяцев", "months": 6, "discount": 15},
 }
+
+# Conversation states for /subprice
+SP_PICK_PLAN, SP_ENTER_RUB, SP_ENTER_STARS = range(90, 93)
+
+
+def _get_plans() -> dict:
+    """Returns merged plan dict with current DB prices."""
+    prices = db.get_plan_prices()
+    result = {}
+    for key, meta in _PLAN_META.items():
+        rub, stars = prices[key]
+        result[key] = {**meta, "price_rub": rub, "price_stars": stars}
+    return result
+
+
+def _fmt_price(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
 
 
 async def _show_plans(msg) -> None:
-    text = (
-        "Подписка открывает доступ к базе ЖК.\n\n"
-        "Тарифы (оплата Telegram Stars ⭐):\n"
-        "• 1 месяц — 299 ⭐\n"
-        "• 3 месяца — 807 ⭐ (скидка 10%)\n"
-        "• 6 месяцев — 1 524 ⭐ (скидка 15%)\n\n"
-        "Выберите тариф:"
-    )
-    keyboard = [
-        [InlineKeyboardButton("1 месяц — 299 ⭐",    callback_data="sub|1m")],
-        [InlineKeyboardButton("3 месяца — 807 ⭐",   callback_data="sub|3m")],
-        [InlineKeyboardButton("6 месяцев — 1 524 ⭐", callback_data="sub|6m")],
-    ]
-    await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    plans = _get_plans()
+    p1 = plans["1m"]
+
+    lines = ["🏠 *Подписка на базу ЖК*\n"]
+    for key, p in plans.items():
+        label   = p["label"]
+        rub     = _fmt_price(p["price_rub"])
+        stars   = _fmt_price(p["price_stars"])
+        disc    = p["discount"]
+        base_rub = _fmt_price(p["months"] * p1["price_rub"])
+
+        if disc:
+            lines.append(
+                f"*{label}* — {rub} ₽  |  {stars} ⭐\n"
+                f"   ~~{base_rub} ₽~~ → скидка {disc}% 🔥"
+            )
+        else:
+            lines.append(f"*{label}* — {rub} ₽  |  {stars} ⭐")
+
+    lines.append("\nВыберите тариф 👇")
+
+    keyboard = []
+    for key, p in plans.items():
+        disc_tag = f" 🔥 -{p['discount']}%" if p["discount"] else ""
+        keyboard.append([InlineKeyboardButton(
+            f"{p['label']} — {_fmt_price(p['price_rub'])} ₽{disc_tag}",
+            callback_data=f"sub|{key}",
+        )])
+
+    await msg.reply_text("\n".join(lines), parse_mode="Markdown",
+                         reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def _require_sub(update: Update) -> bool:
@@ -69,7 +104,7 @@ async def _require_sub(update: Update) -> bool:
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("Оформить подписку", callback_data="sub_plans"),
     ]])
-    text = "Для доступа к базе ЖК необходима подписка.\n\nНажмите кнопку ниже, чтобы выбрать тариф."
+    text = "🔒 Для доступа к базе ЖК необходима подписка.\n\nНажмите кнопку ниже, чтобы выбрать тариф."
     if update.message:
         await update.message.reply_text(text, reply_markup=keyboard)
     elif update.callback_query:
@@ -225,12 +260,16 @@ async def start(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def subscribe_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
+    if is_admin(user_id):
+        await update.message.reply_text("У вас бесплатный доступ как у администратора.")
+        return
     sub = db.get_active_subscription(user_id)
     if sub:
         expires = datetime.fromisoformat(sub["expires_at"]).strftime("%d.%m.%Y")
         await update.message.reply_text(
-            f"У вас уже есть активная подписка (тариф «{sub['plan']}»).\n"
-            f"Действует до: {expires}"
+            f"Подписка активна (тариф «{sub['plan']}»).\n"
+            f"Действует до: *{expires}*",
+            parse_mode="Markdown",
         )
         return
     await _show_plans(update.message)
@@ -243,21 +282,52 @@ async def sub_plans_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE
 
 
 async def sub_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """User selected a plan — show payment method choice."""
     cq = update.callback_query
     await cq.answer()
     plan_key = cq.data.split("|", 1)[1]
-    plan = PLANS.get(plan_key)
+    plans = _get_plans()
+    plan = plans.get(plan_key)
     if not plan:
         return
-    await context.bot.send_invoice(
-        chat_id=cq.from_user.id,
-        title=f"Подписка — {plan['label']}",
-        description=f"Доступ к базе ЖК на {plan['label']}",
-        payload=f"sub|{plan_key}",
-        provider_token="",
-        currency="XTR",
-        prices=[LabeledPrice(label=plan["label"], amount=plan["stars"])],
-    )
+    rub   = _fmt_price(plan["price_rub"])
+    stars = _fmt_price(plan["price_stars"])
+    text  = f"Выбран тариф: *{plan['label']}*\n\nВыберите способ оплаты:"
+    keyboard = [[InlineKeyboardButton(f"Telegram Stars — {stars} ⭐", callback_data=f"subpay|{plan_key}|stars")]]
+    if PAYMENT_TOKEN:
+        keyboard.insert(0, [InlineKeyboardButton(f"Картой (RUB) — {rub} ₽", callback_data=f"subpay|{plan_key}|rub")])
+    await cq.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def sub_pay_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send invoice based on chosen plan + payment method."""
+    cq = update.callback_query
+    await cq.answer()
+    _, plan_key, method = cq.data.split("|")
+    plans = _get_plans()
+    plan = plans.get(plan_key)
+    if not plan:
+        return
+    if method == "rub":
+        await context.bot.send_invoice(
+            chat_id=cq.from_user.id,
+            title=f"Подписка — {plan['label']}",
+            description=f"Доступ к базе ЖК на {plan['label']}",
+            payload=f"sub|{plan_key}|rub",
+            provider_token=PAYMENT_TOKEN,
+            currency="RUB",
+            prices=[LabeledPrice(label=plan["label"], amount=plan["price_rub"] * 100)],
+        )
+    else:
+        await context.bot.send_invoice(
+            chat_id=cq.from_user.id,
+            title=f"Подписка — {plan['label']}",
+            description=f"Доступ к базе ЖК на {plan['label']}",
+            payload=f"sub|{plan_key}|stars",
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label=plan["label"], amount=plan["price_stars"])],
+        )
 
 
 async def precheckout_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -266,15 +336,143 @@ async def precheckout_callback(update: Update, _context: ContextTypes.DEFAULT_TY
 
 async def successful_payment_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
     payment = update.message.successful_payment
-    payload_parts = payment.invoice_payload.split("|")
-    plan_key = payload_parts[1] if len(payload_parts) > 1 else "1m"
-    plan = PLANS.get(plan_key, PLANS["1m"])
-    user_id = update.effective_user.id
+    parts    = payment.invoice_payload.split("|")
+    plan_key = parts[1] if len(parts) > 1 else "1m"
+    plans    = _get_plans()
+    plan     = plans.get(plan_key, plans["1m"])
+    user_id  = update.effective_user.id
     expires_at = datetime.utcnow() + timedelta(days=30 * plan["months"])
     db.save_subscription(user_id, plan["label"], expires_at.isoformat(), payment.telegram_payment_charge_id)
     await update.message.reply_text(
-        f"Оплата прошла! Подписка активна до {expires_at.strftime('%d.%m.%Y')}."
+        f"Оплата прошла!\n"
+        f"Подписка *{plan['label']}* активна до *{expires_at.strftime('%d.%m.%Y')}*.",
+        parse_mode="Markdown",
     )
+
+
+# ---------------------------------------------------------------------------
+# Admin: subscription management
+# ---------------------------------------------------------------------------
+
+async def subscribers_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    subs = db.get_all_active_subscriptions()
+    if not subs:
+        await update.message.reply_text("Нет активных подписчиков.")
+        return
+    lines = ["*Активные подписчики:*\n"]
+    for s in subs:
+        exp = datetime.fromisoformat(s["expires_at"]).strftime("%d.%m.%Y")
+        lines.append(f"• ID `{s['user_id']}` — {s['plan']} — до {exp}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def delsub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    args = context.args
+    if not args or not args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Использование: /delsub <user_id>")
+        return
+    user_id = int(args[0])
+    db.delete_subscription(user_id)
+    await update.message.reply_text(f"Подписка пользователя `{user_id}` удалена.", parse_mode="Markdown")
+
+
+async def addsub_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    args = context.args
+    if len(args) < 2 or not args[0].lstrip("-").isdigit() or not args[1].isdigit():
+        await update.message.reply_text("Использование: /addsub <user_id> <дней>")
+        return
+    user_id, days = int(args[0]), int(args[1])
+    db.extend_subscription(user_id, days)
+    sub = db.get_active_subscription(user_id)
+    exp = datetime.fromisoformat(sub["expires_at"]).strftime("%d.%m.%Y") if sub else "?"
+    await update.message.reply_text(
+        f"Подписка пользователя `{user_id}` продлена на {days} дн.\nАктивна до: *{exp}*",
+        parse_mode="Markdown",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Admin: /subprice — edit plan prices
+# ---------------------------------------------------------------------------
+
+async def subprice_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    plans = _get_plans()
+    lines = ["*Текущие цены тарифов:*\n"]
+    for key, p in plans.items():
+        lines.append(f"• {p['label']}: {_fmt_price(p['price_rub'])} ₽ / {_fmt_price(p['price_stars'])} ⭐")
+    lines.append("\nВыберите тариф для изменения:")
+    keyboard = [[InlineKeyboardButton(p["label"], callback_data=f"sp|{key}")] for key, p in plans.items()]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="sp|cancel")])
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown",
+                                    reply_markup=InlineKeyboardMarkup(keyboard))
+    return SP_PICK_PLAN
+
+
+async def sp_pick_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cq = update.callback_query
+    await cq.answer()
+    if cq.data == "sp|cancel":
+        await cq.edit_message_text("Отменено.")
+        return ConversationHandler.END
+    plan_key = cq.data.split("|", 1)[1]
+    plans = _get_plans()
+    if plan_key not in plans:
+        return ConversationHandler.END
+    context.user_data["sp_plan_key"] = plan_key
+    await cq.edit_message_text(
+        f"Тариф: *{plans[plan_key]['label']}*\n\nВведите новую цену в рублях:",
+        parse_mode="Markdown",
+    )
+    return SP_ENTER_RUB
+
+
+async def sp_enter_rub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip().replace(" ", "")
+    if not text.isdigit():
+        await update.message.reply_text("Введите целое число (цена в рублях):")
+        return SP_ENTER_RUB
+    context.user_data["sp_price_rub"] = int(text)
+    await update.message.reply_text(
+        "Введите цену в Telegram Stars,\n"
+        "или отправьте *=* чтобы Stars = рублям:",
+        parse_mode="Markdown",
+    )
+    return SP_ENTER_STARS
+
+
+async def sp_enter_stars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip().replace(" ", "")
+    if text == "=":
+        price_stars = context.user_data["sp_price_rub"]
+    elif text.isdigit():
+        price_stars = int(text)
+    else:
+        await update.message.reply_text("Введите целое число или *=*:", parse_mode="Markdown")
+        return SP_ENTER_STARS
+    plan_key   = context.user_data["sp_plan_key"]
+    price_rub  = context.user_data["sp_price_rub"]
+    db.update_plan_prices(plan_key, price_rub, price_stars)
+    plans = _get_plans()
+    await update.message.reply_text(
+        f"Цена тарифа *{plans[plan_key]['label']}* обновлена:\n"
+        f"• Карта: *{_fmt_price(price_rub)} ₽*\n"
+        f"• Stars: *{_fmt_price(price_stars)} ⭐*",
+        parse_mode="Markdown",
+    )
+    return ConversationHandler.END
+
+
+async def subprice_cancel(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Отменено.")
+    return ConversationHandler.END
 
 
 async def _send_apt_card(msg, apt: dict, admin_user: bool) -> None:
@@ -388,7 +586,7 @@ async def list_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
 
 _ADMIN_COMMANDS = [
     BotCommand("start",           "Начать / помощь"),
-    BotCommand("subscribe",       "Оформить подписку"),
+    BotCommand("subscribe",       "Статус подписки"),
     BotCommand("post",            "Добавить новый ЖК"),
     BotCommand("edit",            "Редактировать ЖК"),
     BotCommand("delete",          "Удалить ЖК"),
@@ -402,6 +600,10 @@ _ADMIN_COMMANDS = [
     BotCommand("addadmin",        "Добавить администратора"),
     BotCommand("removeadmin",     "Удалить администратора"),
     BotCommand("listadmins",      "Список администраторов"),
+    BotCommand("subscribers",     "Список активных подписчиков"),
+    BotCommand("addsub",          "Выдать подписку: /addsub <id> <дней>"),
+    BotCommand("delsub",          "Удалить подписку: /delsub <id>"),
+    BotCommand("subprice",        "Изменить цены тарифов"),
     BotCommand("cancel",          "Отменить текущее действие"),
 ]
 
@@ -2410,6 +2612,17 @@ def main() -> None:
         per_message=False,
     )
 
+    subprice_conv = ConversationHandler(
+        entry_points=[CommandHandler("subprice", subprice_cmd)],
+        states={
+            SP_PICK_PLAN:   [CallbackQueryHandler(sp_pick_plan,   pattern=r"^sp\|")],
+            SP_ENTER_RUB:   [MessageHandler(filters.TEXT & ~filters.COMMAND, sp_enter_rub)],
+            SP_ENTER_STARS: [MessageHandler(filters.TEXT & ~filters.COMMAND, sp_enter_stars)],
+        },
+        fallbacks=[CommandHandler("cancel", subprice_cancel)],
+        per_message=False,
+    )
+
     app.add_handler(CommandHandler("start",          start))
     app.add_handler(CommandHandler("subscribe",      subscribe_cmd))
     app.add_handler(CommandHandler("list",           list_cmd))
@@ -2421,15 +2634,20 @@ def main() -> None:
     app.add_handler(CommandHandler("adddistrict",    adddistrict_cmd))
     app.add_handler(CommandHandler("removedistrict", removedistrict_cmd))
     app.add_handler(CommandHandler("listdistricts",  listdistricts_cmd))
+    app.add_handler(CommandHandler("subscribers",    subscribers_cmd))
+    app.add_handler(CommandHandler("addsub",         addsub_cmd))
+    app.add_handler(CommandHandler("delsub",         delsub_cmd))
     app.add_handler(post_conv)
     app.add_handler(edit_conv)
     app.add_handler(calc_setup_conv)
     app.add_handler(setcount_conv)
     app.add_handler(user_calc_conv)
+    app.add_handler(subprice_conv)
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
-    app.add_handler(CallbackQueryHandler(sub_plans_callback, pattern=r"^sub_plans$"))
-    app.add_handler(CallbackQueryHandler(sub_plan_callback,  pattern=r"^sub\|"))
+    app.add_handler(CallbackQueryHandler(sub_plans_callback,    pattern=r"^sub_plans$"))
+    app.add_handler(CallbackQueryHandler(sub_plan_callback,     pattern=r"^sub\|"))
+    app.add_handler(CallbackQueryHandler(sub_pay_method_callback, pattern=r"^subpay\|"))
     app.add_handler(CallbackQueryHandler(del_ask_callback,    pattern=r"^del_ask\|"))
     app.add_handler(CallbackQueryHandler(del_yes_callback,    pattern=r"^del_yes\|"))
     app.add_handler(CallbackQueryHandler(del_cancel_callback, pattern=r"^del_cancel$"))
