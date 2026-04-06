@@ -12,6 +12,11 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
+def _column_exists(conn, table: str, column: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r["name"] == column for r in rows)
+
+
 def init_db() -> None:
     Path("data").mkdir(exist_ok=True)
     with _get_conn() as conn:
@@ -24,14 +29,17 @@ def init_db() -> None:
                 price_per_sqm    INTEGER NOT NULL,
                 floor_prices     TEXT DEFAULT NULL,
                 description      TEXT DEFAULT '',
-                main_photo       TEXT NOT NULL,
-                photos_url       TEXT NOT NULL,
-                layouts_url      TEXT NOT NULL,
-                chess_url        TEXT NOT NULL,
-                installment_text TEXT NOT NULL,
-                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                main_photo         TEXT NOT NULL,
+                photos_url         TEXT NOT NULL,
+                layouts_url        TEXT NOT NULL,
+                layouts_file_ids   TEXT DEFAULT '[]',
+                chess_url          TEXT NOT NULL,
+                installment_text   TEXT NOT NULL,
+                created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        conn.execute("ALTER TABLE apartments ADD COLUMN layouts_file_ids TEXT DEFAULT '[]'"
+                     ) if not _column_exists(conn, "apartments", "layouts_file_ids") else None
         conn.execute("""
             CREATE TABLE IF NOT EXISTS calculators (
                 apt_id TEXT PRIMARY KEY,
@@ -92,11 +100,14 @@ def init_db() -> None:
                 installment_text          TEXT DEFAULT '',
                 installment_price_per_sqm INTEGER DEFAULT NULL,
                 layouts_url               TEXT DEFAULT '',
+                layouts_file_ids          TEXT DEFAULT '[]',
                 photos_url                TEXT DEFAULT '',
                 photos_file_ids           TEXT DEFAULT '[]',
                 available                 INTEGER NOT NULL DEFAULT 1
             )
         """)
+        conn.execute("ALTER TABLE commercial ADD COLUMN layouts_file_ids TEXT DEFAULT '[]'"
+                     ) if not _column_exists(conn, "commercial", "layouts_file_ids") else None
         conn.execute("""
             CREATE TABLE IF NOT EXISTS investor_units (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -157,13 +168,14 @@ def save_apartment(apt: dict) -> None:
     floor_prices = apt.get("floor_prices")
     floor_prices_json = json.dumps(floor_prices, ensure_ascii=False) if floor_prices else None
     photos_file_ids = apt.get("photos_file_ids") or []
+    layouts_file_ids = apt.get("layouts_file_ids") or []
     with _get_conn() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO apartments
             (id, name, aliases, address, price_per_sqm, floor_prices, description,
-             main_photo, photos_url, layouts_url, chess_url, installment_text, district_id,
-             photos_file_ids, installment_price_per_sqm)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             main_photo, photos_url, layouts_url, layouts_file_ids, chess_url,
+             installment_text, district_id, photos_file_ids, installment_price_per_sqm)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             apt["id"],
             apt["name"],
@@ -174,8 +186,9 @@ def save_apartment(apt: dict) -> None:
             apt.get("description", ""),
             apt["main_photo"],
             apt.get("photos_url", ""),
-            apt["layouts_url"],
-            apt["chess_url"],
+            apt.get("layouts_url", ""),
+            json.dumps(layouts_file_ids, ensure_ascii=False),
+            apt.get("chess_url", ""),
             apt.get("installment_text", ""),
             apt.get("district_id"),
             json.dumps(photos_file_ids, ensure_ascii=False),
@@ -190,17 +203,18 @@ def get_all_apartments() -> list[dict]:
     result = []
     for row in rows:
         apt = dict(row)
-        apt["aliases"] = json.loads(apt["aliases"])
-        apt["floor_prices"] = json.loads(apt["floor_prices"]) if apt.get("floor_prices") else None
-        apt["photos_file_ids"] = json.loads(apt["photos_file_ids"]) if apt.get("photos_file_ids") else []
+        apt["aliases"]          = json.loads(apt["aliases"])
+        apt["floor_prices"]     = json.loads(apt["floor_prices"])     if apt.get("floor_prices")     else None
+        apt["photos_file_ids"]  = json.loads(apt["photos_file_ids"])  if apt.get("photos_file_ids")  else []
+        apt["layouts_file_ids"] = json.loads(apt["layouts_file_ids"]) if apt.get("layouts_file_ids") else []
         result.append(apt)
     return result
 
 
 _ALLOWED_FIELDS = {
     "name", "address", "price_per_sqm", "installment_price_per_sqm", "description",
-    "main_photo", "photos_url", "photos_file_ids", "layouts_url", "chess_url",
-    "installment_text", "district_id",
+    "main_photo", "photos_url", "photos_file_ids", "layouts_url", "layouts_file_ids",
+    "chess_url", "installment_text", "district_id",
 }
 
 
@@ -434,8 +448,9 @@ def save_commercial(apt_id: str, data: dict) -> None:
         conn.execute("""
             INSERT OR REPLACE INTO commercial
             (apt_id, price_per_sqm, floor_prices, installment_text,
-             installment_price_per_sqm, layouts_url, photos_url, photos_file_ids, available)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             installment_price_per_sqm, layouts_url, layouts_file_ids,
+             photos_url, photos_file_ids, available)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             apt_id,
             data["price_per_sqm"],
@@ -443,6 +458,7 @@ def save_commercial(apt_id: str, data: dict) -> None:
             data.get("installment_text", ""),
             data.get("installment_price_per_sqm"),
             data.get("layouts_url", ""),
+            json.dumps(data.get("layouts_file_ids", []), ensure_ascii=False),
             data.get("photos_url", ""),
             json.dumps(data.get("photos_file_ids", []), ensure_ascii=False),
             data.get("available", 1),
@@ -456,8 +472,9 @@ def get_commercial(apt_id: str) -> dict | None:
     if not row:
         return None
     d = dict(row)
-    d["floor_prices"] = json.loads(d["floor_prices"]) if d.get("floor_prices") else None
-    d["photos_file_ids"] = json.loads(d["photos_file_ids"]) if d.get("photos_file_ids") else []
+    d["floor_prices"]     = json.loads(d["floor_prices"])     if d.get("floor_prices")     else None
+    d["photos_file_ids"]  = json.loads(d["photos_file_ids"])  if d.get("photos_file_ids")  else []
+    d["layouts_file_ids"] = json.loads(d["layouts_file_ids"]) if d.get("layouts_file_ids") else []
     return d
 
 

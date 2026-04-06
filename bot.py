@@ -514,8 +514,11 @@ async def _send_apt_card(msg, apt: dict, admin_user: bool, user_id: int = 0) -> 
         keyboard.append([InlineKeyboardButton("Все фото 📷", callback_data=f"aptphotos|{apt['id']}")])
     elif has_url:
         keyboard.append([InlineKeyboardButton("Все фото",   url=apt["photos_url"])])
-    if is_valid_url(apt["layouts_url"]):
-        keyboard.append([InlineKeyboardButton("Планировки", url=apt["layouts_url"])])
+    _layouts_fids = apt.get("layouts_file_ids") or []
+    if _layouts_fids:
+        keyboard.append([InlineKeyboardButton("Планировки 📷", callback_data=f"aptlayouts|{apt['id']}")])
+    elif is_valid_url(apt.get("layouts_url", "")):
+        keyboard.append([InlineKeyboardButton("Планировки 🔗", url=apt["layouts_url"])])
     if is_valid_url(apt["chess_url"]):
         keyboard.append([InlineKeyboardButton("Шахматка",   url=apt["chess_url"])])
     keyboard.append([InlineKeyboardButton("Условия рассрочки", callback_data=f"inst|{apt['id']}")])
@@ -583,6 +586,46 @@ async def aptphotos_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE
         await cq.message.reply_text("Дополнительная ссылка:", reply_markup=kb)
     elif not file_ids:
         await cq.message.reply_text("Фото галереи не добавлены.")
+
+
+async def aptlayouts_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    apt_id   = cq.data.split("|", 1)[1]
+    apt      = next((a for a in db.get_all_apartments() if a["id"] == apt_id), None)
+    if not apt:
+        await cq.message.reply_text("Информация не найдена.")
+        return
+    file_ids = apt.get("layouts_file_ids") or []
+    url      = apt.get("layouts_url", "")
+    if file_ids:
+        media = [InputMediaPhoto(fid) for fid in file_ids]
+        await cq.message.reply_media_group(media)
+    if is_valid_url(url):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Ссылка на планировки 🔗", url=url)]])
+        await cq.message.reply_text("Дополнительная ссылка:", reply_markup=kb)
+    elif not file_ids:
+        await cq.message.reply_text("Планировки не добавлены.")
+
+
+async def commlay_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    await cq.answer()
+    apt_id = cq.data.split("|", 1)[1]
+    comm   = db.get_commercial(apt_id)
+    if not comm:
+        await cq.message.reply_text("Информация не найдена.")
+        return
+    file_ids = comm.get("layouts_file_ids") or []
+    url      = comm.get("layouts_url", "")
+    if file_ids:
+        media = [InputMediaPhoto(fid) for fid in file_ids]
+        await cq.message.reply_media_group(media)
+    if is_valid_url(url):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Ссылка на планировки 🔗", url=url)]])
+        await cq.message.reply_text("Дополнительная ссылка:", reply_markup=kb)
+    elif not file_ids:
+        await cq.message.reply_text("Планировки не добавлены.")
 
 
 # ---------------------------------------------------------------------------
@@ -1086,10 +1129,11 @@ EDITABLE_FIELDS = {
     "installment_price_per_sqm": "Цена за м² в рассрочку",
     "description":               "Описание",
     "main_photo":       "Главное фото",
-    "photos_file_ids":  "Фото галереи (до 10 фото)",
-    "photos_url":       "Ссылка — все фото",
-    "layouts_url":      "Ссылка — планировки",
-    "chess_url":        "Ссылка — шахматка",
+    "photos_file_ids":   "Фото галереи (до 10 фото)",
+    "photos_url":        "Ссылка — все фото",
+    "layouts_file_ids":  "Фото планировок (до 10 фото)",
+    "layouts_url":       "Ссылка — планировки",
+    "chess_url":         "Ссылка — шахматка",
     "installment_text": "Условия рассрочки",
 }
 
@@ -1194,6 +1238,25 @@ async def edit_photos_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return EDIT_AFTER
 
 
+async def edit_layouts_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cq = update.callback_query
+    await cq.answer()
+    import json as _json
+    apt_id   = context.user_data["edit_apt_id"]
+    file_ids = [] if cq.data == "edit_layouts_clear" else context.user_data.get("edit_layouts_list", [])
+    db.update_apartment_field(apt_id, "layouts_file_ids", _json.dumps(file_ids, ensure_ascii=False))
+    label = EDITABLE_FIELDS["layouts_file_ids"]
+    kb = [[
+        InlineKeyboardButton("Изменить ещё поле", callback_data="edit_more"),
+        InlineKeyboardButton("Готово",            callback_data="edit_done"),
+    ]]
+    await cq.edit_message_text(
+        f"«{label}» обновлено ({len(file_ids)} фото).",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+    return EDIT_AFTER
+
+
 async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     apt_id = context.user_data["edit_apt_id"]
     field  = context.user_data["edit_field"]
@@ -1214,6 +1277,26 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         ]
         await update.message.reply_text(
             f"Фото {n}/10 добавлено. Отправляйте ещё или нажмите Готово:",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return EDIT_VALUE
+
+    if field == "layouts_file_ids":
+        if not update.message.photo:
+            await update.message.reply_text("Нужно отправить фото планировки.")
+            return EDIT_VALUE
+        file_ids = context.user_data.setdefault("edit_layouts_list", [])
+        if len(file_ids) >= 10:
+            await update.message.reply_text("Максимум 10 фото. Нажмите Готово.")
+            return EDIT_VALUE
+        file_ids.append(update.message.photo[-1].file_id)
+        n = len(file_ids)
+        kb = [
+            [InlineKeyboardButton(f"Готово ({n}/10 фото)", callback_data="edit_layouts_done")],
+            [InlineKeyboardButton("Очистить планировки",   callback_data="edit_layouts_clear")],
+        ]
+        await update.message.reply_text(
+            f"Планировка {n}/10 добавлена. Отправляйте ещё или нажмите Готово:",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return EDIT_VALUE
@@ -1525,13 +1608,54 @@ async def s_photos_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         context.user_data["photos_file_ids"] = []
         context.user_data["photos_url"] = ""
     await cq.edit_message_text("Галерея сохранена.")
-    await update.effective_chat.send_message("Шаг 10/12 — Ссылка на планировки:")
+    await update.effective_chat.send_message(
+        "Шаг 10/12 — Планировки\n\n"
+        "Отправьте фото планировок, ссылку (Google Drive / Яндекс Диск) или всё вместе.\n"
+        "Нажмите Пропустить, если нет планировок.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Пропустить", callback_data="layouts_skip"),
+        ]]),
+    )
     return S_LAYOUTS
 
 
 async def s_layouts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["layouts_url"] = update.message.text.strip()
-    await update.message.reply_text("Шаг 11/12 — Ссылка на шахматку:")
+    """Handles photo or URL for layouts collection."""
+    if update.message.photo:
+        file_ids = context.user_data.setdefault("layouts_file_ids", [])
+        if len(file_ids) >= 10:
+            await update.message.reply_text("Максимум 10 фото уже добавлено. Нажмите Готово.")
+            return S_LAYOUTS
+        file_ids.append(update.message.photo[-1].file_id)
+    else:
+        context.user_data["layouts_url"] = update.message.text.strip()
+
+    n   = len(context.user_data.get("layouts_file_ids", []))
+    url = context.user_data.get("layouts_url", "")
+    parts = []
+    if n:   parts.append(f"{n}/10 фото")
+    if url: parts.append("ссылка ✓")
+    status = ", ".join(parts)
+
+    kb = [
+        [InlineKeyboardButton(f"Готово ({status})", callback_data="layouts_done")],
+        [InlineKeyboardButton("Пропустить",          callback_data="layouts_skip")],
+    ]
+    await update.message.reply_text(
+        "Отправляйте ещё фото или ссылку, или нажмите Готово:",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+    return S_LAYOUTS
+
+
+async def s_layouts_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cq = update.callback_query
+    await cq.answer()
+    if cq.data == "layouts_skip":
+        context.user_data["layouts_file_ids"] = []
+        context.user_data["layouts_url"] = ""
+    await cq.edit_message_text("Планировки сохранены.")
+    await update.effective_chat.send_message("Шаг 11/12 — Ссылка на шахматку:")
     return S_CHESS
 
 
@@ -1594,7 +1718,8 @@ async def s_comm_inst_price(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return S_COMM_INST_PRICE
     context.user_data["comm_inst_price_per_sqm"] = int(raw)
     await update.message.reply_text(
-        "Коммерция — Ссылка на планировки.\nЕсли нет — введите прочерк (-):"
+        "Коммерция — Планировки\n\nОтправьте фото, ссылку или нажмите Пропустить:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Пропустить", callback_data="comm_layouts_skip")]]),
     )
     return S_COMM_LAYOUTS
 
@@ -1605,15 +1730,47 @@ async def s_comm_inst_price_skip(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["comm_inst_price_per_sqm"] = None
     await cq.edit_message_text("Цена в рассрочку: нет")
     await update.effective_chat.send_message(
-        "Коммерция — Ссылка на планировки.\nЕсли нет — введите прочерк (-):"
+        "Коммерция — Планировки\n\nОтправьте фото, ссылку или нажмите Пропустить:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Пропустить", callback_data="comm_layouts_skip")]]),
     )
     return S_COMM_LAYOUTS
 
 
 async def s_comm_layouts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    context.user_data["comm_layouts_url"] = "" if text == "-" else text
+    if update.message.photo:
+        file_ids = context.user_data.setdefault("comm_layouts_file_ids", [])
+        if len(file_ids) < 10:
+            file_ids.append(update.message.photo[-1].file_id)
+    else:
+        text = update.message.text.strip()
+        context.user_data["comm_layouts_url"] = "" if text == "-" else text
+
+    n   = len(context.user_data.get("comm_layouts_file_ids", []))
+    url = context.user_data.get("comm_layouts_url", "")
+    parts = []
+    if n:   parts.append(f"{n}/10 фото")
+    if url: parts.append("ссылка ✓")
+    status = ", ".join(parts)
+
+    kb = [
+        [InlineKeyboardButton(f"Готово ({status})", callback_data="comm_layouts_done")],
+        [InlineKeyboardButton("Пропустить",          callback_data="comm_layouts_skip")],
+    ]
     await update.message.reply_text(
+        "Отправляйте ещё фото или ссылку, или нажмите Готово:",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+    return S_COMM_LAYOUTS
+
+
+async def s_comm_layouts_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    cq = update.callback_query
+    await cq.answer()
+    if cq.data == "comm_layouts_skip":
+        context.user_data["comm_layouts_file_ids"] = []
+        context.user_data["comm_layouts_url"] = ""
+    await cq.edit_message_text("Планировки коммерции сохранены.")
+    await update.effective_chat.send_message(
         "Коммерция — Условия рассрочки.\nЕсли нет — введите прочерк (-):"
     )
     return S_COMM_INST
@@ -1672,6 +1829,7 @@ async def s_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             "installment_text":          apt_data.get("comm_installment_text", ""),
             "installment_price_per_sqm": apt_data.get("comm_inst_price_per_sqm"),
             "layouts_url":               apt_data.get("comm_layouts_url", ""),
+            "layouts_file_ids":          apt_data.get("comm_layouts_file_ids", []),
         })
     context.user_data.clear()
     keyboard = [[
@@ -1716,8 +1874,11 @@ async def comm_card_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE
     avail_mark = "" if comm.get("available", 1) else "\n\n❌ *НЕТ В НАЛИЧИИ*"
     caption = f"*Коммерческие помещения*\n\nЦена за м²: {price_display}{inst_line}{avail_mark}"
     keyboard = []
-    if is_valid_url(comm.get("layouts_url", "")):
-        keyboard.append([InlineKeyboardButton("Планировки", url=comm["layouts_url"])])
+    _comm_lay_fids = comm.get("layouts_file_ids") or []
+    if _comm_lay_fids:
+        keyboard.append([InlineKeyboardButton("Планировки 📷", callback_data=f"commlay|{apt_id}")])
+    elif is_valid_url(comm.get("layouts_url", "")):
+        keyboard.append([InlineKeyboardButton("Планировки 🔗", url=comm["layouts_url"])])
     if comm.get("installment_text"):
         keyboard.append([InlineKeyboardButton("Условия рассрочки", callback_data=f"comm_inst|{apt_id}")])
     if db.get_calculator(f"comm_{apt_id}"):
@@ -2164,8 +2325,11 @@ async def top_comm_callback(update: Update, _context: ContextTypes.DEFAULT_TYPE)
     avail_mark = "" if comm.get("available", 1) else "\n\n❌ *НЕТ В НАЛИЧИИ*"
     caption    = f"*Коммерческие помещения*\n\nЦена за м²: {price_display}{inst_line}{avail_mark}"
     keyboard   = []
-    if is_valid_url(comm.get("layouts_url", "")):
-        keyboard.append([InlineKeyboardButton("Планировки", url=comm["layouts_url"])])
+    _comm_lay_fids = comm.get("layouts_file_ids") or []
+    if _comm_lay_fids:
+        keyboard.append([InlineKeyboardButton("Планировки 📷", callback_data=f"commlay|{apt_id}")])
+    elif is_valid_url(comm.get("layouts_url", "")):
+        keyboard.append([InlineKeyboardButton("Планировки 🔗", url=comm["layouts_url"])])
     if comm.get("installment_text"):
         keyboard.append([InlineKeyboardButton("Условия рассрочки", callback_data=f"comm_inst|{apt_id}")])
     if db.get_calculator(f"comm_{apt_id}"):
@@ -3363,7 +3527,11 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, s_photos),
                 CallbackQueryHandler(s_photos_done, pattern=r"^photos_(done|skip)$"),
             ],
-            S_LAYOUTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, s_layouts)],
+            S_LAYOUTS: [
+                MessageHandler(filters.PHOTO, s_layouts),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, s_layouts),
+                CallbackQueryHandler(s_layouts_done, pattern=r"^layouts_(done|skip)$"),
+            ],
             S_CHESS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, s_chess)],
             S_INST:    [MessageHandler(filters.TEXT & ~filters.COMMAND, s_inst)],
             S_ASK_COMM:       [CallbackQueryHandler(s_ask_comm,           pattern=r"^ask_comm\|")],
@@ -3372,7 +3540,11 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, s_comm_inst_price),
                 CallbackQueryHandler(s_comm_inst_price_skip, pattern=r"^comm_skip_inst_price$"),
             ],
-            S_COMM_LAYOUTS:   [MessageHandler(filters.TEXT & ~filters.COMMAND, s_comm_layouts)],
+            S_COMM_LAYOUTS: [
+                MessageHandler(filters.PHOTO, s_comm_layouts),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, s_comm_layouts),
+                CallbackQueryHandler(s_comm_layouts_done, pattern=r"^comm_layouts_(done|skip)$"),
+            ],
             S_COMM_INST:      [MessageHandler(filters.TEXT & ~filters.COMMAND, s_comm_inst)],
             S_CONFIRM: [CallbackQueryHandler(s_confirm, pattern=r"^post_(save|discard)$")],
         },
@@ -3386,7 +3558,8 @@ def main() -> None:
             EDIT_PICK_APT:   [CallbackQueryHandler(edit_pick_apt,   pattern=r"^(ea\||ecx$)")],
             EDIT_PICK_FIELD: [CallbackQueryHandler(edit_pick_field, pattern=r"^(ef\||ecx$)")],
             EDIT_VALUE: [
-                CallbackQueryHandler(edit_photos_done, pattern=r"^edit_photos_(done|clear)$"),
+                CallbackQueryHandler(edit_photos_done,   pattern=r"^edit_photos_(done|clear)$"),
+                CallbackQueryHandler(edit_layouts_done,  pattern=r"^edit_layouts_(done|clear)$"),
                 MessageHandler(filters.PHOTO, edit_value),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value),
             ],
@@ -3576,6 +3749,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(del_cancel_callback, pattern=r"^del_cancel$"))
     app.add_handler(CallbackQueryHandler(installment_callback,    pattern=r"^inst\|"))
     app.add_handler(CallbackQueryHandler(aptphotos_callback,      pattern=r"^aptphotos\|"))
+    app.add_handler(CallbackQueryHandler(aptlayouts_callback,     pattern=r"^aptlayouts\|"))
+    app.add_handler(CallbackQueryHandler(commlay_callback,        pattern=r"^commlay\|"))
     app.add_handler(CallbackQueryHandler(setup_calc_callback,     pattern=r"^setup_calc"))
     app.add_handler(CallbackQueryHandler(browse_district_callback, pattern=r"^br_d\|"))
     app.add_handler(CallbackQueryHandler(browse_apt_callback,      pattern=r"^br_a\|"))
