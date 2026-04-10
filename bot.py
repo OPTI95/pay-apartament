@@ -73,17 +73,16 @@ async def _show_plans(msg) -> None:
     for key, p in plans.items():
         label   = p["label"]
         rub     = _fmt_price(p["price_rub"])
-        stars   = _fmt_price(p["price_stars"])
         disc    = p["discount"]
         base_rub = _fmt_price(p["months"] * p1["price_rub"])
 
         if disc:
             lines.append(
-                f"*{label}* — {rub} ₽  |  {stars} ⭐\n"
+                f"*{label}* — {rub} ₽\n"
                 f"   ~~{base_rub} ₽~~ → скидка {disc}% 🔥"
             )
         else:
-            lines.append(f"*{label}* — {rub} ₽  |  {stars} ⭐")
+            lines.append(f"*{label}* — {rub} ₽")
 
     lines.append("\nВыберите тариф 👇")
 
@@ -303,11 +302,11 @@ async def sub_plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not plan:
         return
     rub   = _fmt_price(plan["price_rub"])
-    stars = _fmt_price(plan["price_stars"])
     text  = f"Выбран тариф: *{plan['label']}*\n\nВыберите способ оплаты:"
-    keyboard = [[InlineKeyboardButton(f"Telegram Stars — {stars} ⭐", callback_data=f"subpay|{plan_key}|stars")]]
+    keyboard = []
     if PAYMENT_TOKEN:
-        keyboard.insert(0, [InlineKeyboardButton(f"Картой (RUB) — {rub} ₽", callback_data=f"subpay|{plan_key}|rub")])
+        keyboard.append([InlineKeyboardButton(f"Картой (RUB) — {rub} ₽", callback_data=f"subpay|{plan_key}|rub")])
+    keyboard.append([InlineKeyboardButton("Написать менеджеру", callback_data=f"subpay|{plan_key}|contact")])
     await cq.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
@@ -330,15 +329,12 @@ async def sub_pay_method_callback(update: Update, context: ContextTypes.DEFAULT_
             currency="RUB",
             prices=[LabeledPrice(label=plan["label"], amount=plan["price_rub"] * 100)],
         )
-    else:
-        await context.bot.send_invoice(
-            chat_id=cq.from_user.id,
-            title=f"Подписка — {plan['label']}",
-            description=f"Доступ к базе ЖК на {plan['label']}",
-            payload=f"sub|{plan_key}|stars",
-            provider_token="",
-            currency="XTR",
-            prices=[LabeledPrice(label=plan["label"], amount=plan["price_stars"])],
+    elif method == "contact":
+        rub = _fmt_price(plan["price_rub"])
+        await cq.message.reply_text(
+            f"Для оплаты тарифа *{plan['label']}* — напишите в личку @m_khunarikov 👤\n\n"
+            f"Укажите тариф: *{plan['label']}* ({rub} ₽)",
+            parse_mode="Markdown",
         )
 
 
@@ -419,7 +415,7 @@ async def subprice_cmd(update: Update, _context: ContextTypes.DEFAULT_TYPE) -> i
     plans = _get_plans()
     lines = ["*Текущие цены тарифов:*\n"]
     for key, p in plans.items():
-        lines.append(f"• {p['label']}: {_fmt_price(p['price_rub'])} ₽ / {_fmt_price(p['price_stars'])} ⭐")
+        lines.append(f"• {p['label']}: {_fmt_price(p['price_rub'])} ₽")
     lines.append("\nВыберите тариф для изменения:")
     keyboard = [[InlineKeyboardButton(p["label"], callback_data=f"sp|{key}")] for key, p in plans.items()]
     keyboard.append([InlineKeyboardButton("Отмена", callback_data="sp|cancel")])
@@ -451,32 +447,13 @@ async def sp_enter_rub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     if not text.isdigit():
         await update.message.reply_text("Введите целое число (цена в рублях):")
         return SP_ENTER_RUB
-    context.user_data["sp_price_rub"] = int(text)
-    await update.message.reply_text(
-        "Введите цену в Telegram Stars,\n"
-        "или отправьте *=* чтобы Stars = рублям:",
-        parse_mode="Markdown",
-    )
-    return SP_ENTER_STARS
-
-
-async def sp_enter_stars(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip().replace(" ", "")
-    if text == "=":
-        price_stars = context.user_data["sp_price_rub"]
-    elif text.isdigit():
-        price_stars = int(text)
-    else:
-        await update.message.reply_text("Введите целое число или *=*:", parse_mode="Markdown")
-        return SP_ENTER_STARS
-    plan_key   = context.user_data["sp_plan_key"]
-    price_rub  = context.user_data["sp_price_rub"]
-    db.update_plan_prices(plan_key, price_rub, price_stars)
+    price_rub = int(text)
+    plan_key  = context.user_data["sp_plan_key"]
+    db.update_plan_prices(plan_key, price_rub, price_rub)
     plans = _get_plans()
     await update.message.reply_text(
         f"Цена тарифа *{plans[plan_key]['label']}* обновлена:\n"
-        f"• Карта: *{_fmt_price(price_rub)} ₽*\n"
-        f"• Stars: *{_fmt_price(price_stars)} ⭐*",
+        f"• Карта: *{_fmt_price(price_rub)} ₽*",
         parse_mode="Markdown",
     )
     return ConversationHandler.END
@@ -3662,7 +3639,6 @@ def main() -> None:
         states={
             SP_PICK_PLAN:   [CallbackQueryHandler(sp_pick_plan,   pattern=r"^sp\|")],
             SP_ENTER_RUB:   [MessageHandler(filters.TEXT & ~filters.COMMAND, sp_enter_rub)],
-            SP_ENTER_STARS: [MessageHandler(filters.TEXT & ~filters.COMMAND, sp_enter_stars)],
         },
         fallbacks=[CommandHandler("cancel", subprice_cancel)],
         per_message=False,
